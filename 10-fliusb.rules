@@ -1,0 +1,1 @@
+KERNEL=="fliusb*", MODE="666", GROUP="plugdev"

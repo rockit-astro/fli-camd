@@ -1,0 +1,797 @@
+#!/usr/bin/env python3.4
+#
+# This file is part of rasa-camd.
+#
+# rasa-camd is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rasa-camd is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rasa-camd.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon for controlling the RASA prototype cameras via Pyro"""
+
+# pylint: disable=invalid-name
+# pylint: disable=no-self-use
+# pylint: disable=broad-except
+# pylint: disable=too-few-public-methods
+# pylint: disable=too-many-return-statements
+# pylint: disable=too-many-instance-attributes
+# pylint: disable=too-many-lines
+# pylint: disable=too-many-branches
+# pylint: disable=too-many-statements
+# pylint: disable=too-many-locals
+# pylint: disable=too-many-arguments
+
+import argparse
+from ctypes import (c_double, c_long, c_size_t, c_uint16, c_char_p, byref, create_string_buffer,
+                    sizeof, POINTER, CDLL)
+import datetime
+import json
+import pathlib
+import shutil
+import threading
+import time
+from astropy.io import fits
+import numpy
+import Pyro4
+from warwick.observatory.common import (
+    daemons,
+    log,
+    IP,
+    TryLock)
+from warwick.observatory.common.helpers import pyro_client_matches
+from warwick.rasa.camera import CommandStatus, CameraStatus
+
+daemons.observatory_log.host = '127.0.0.1'
+
+# Set automatically when generating RPM package
+SOFTWARE_VERSION = "UNKNOWN"
+
+CONFIG = {
+    'rasa': {
+        'daemon': daemons.rasa_camera,
+        'serial': 'ML6314917',
+        'temperature': -20,
+        'exposure': 1,
+        'delay': 0,
+        'logtable': 'rasa_camd',
+        'arm': 'RASA',
+        'outputpath': '/var/tmp/',
+        'outputprefix': 'rasa',
+        'expcountlog': '/var/tmp/rasa-counter.json',
+        'controlips': [IP.RASAMain]
+    },
+}
+
+# If frames are being generated faster than the pipeline can handle
+# then we block the next frame until it is ready.
+# If it blocks for longer than this interval (in seconds) give up and cancel the sequence
+PIPELINE_HANDOVER_TIMEOUT = 10
+
+# Delay between camera state queries (in seconds)
+STATUS_QUERY_DELAY = 1
+
+def open_device(driver, serial):
+    """Returns c_long(-1) if device is not found"""
+    # Enumerate cameras to find target
+    devices = POINTER(c_char_p)()
+    device_serial = create_string_buffer(64)
+    driver.FLIList(c_long(258), byref(devices))
+    if devices:
+        try:
+            i = 0
+            while devices[i]:
+                name, model = devices[i].split(b";")
+                device = c_long()
+                driver.FLIOpen(byref(device), name, c_long(258))
+                driver.FLIGetSerialString(device, device_serial, c_size_t(64))
+                if device_serial.value.decode('ascii') == serial:
+                    return device, model.decode('ascii')
+
+                driver.FLIClose(device)
+                i += 1
+        finally:
+            driver.FLIFreeList(devices)
+    return c_long(-1), None
+
+class CameraDaemon:
+    """Daemon interface for andor camera"""
+    def __init__(self, config):
+        self._config = config
+        self._status = CameraStatus.Disabled
+        self._log_table = config['logtable']
+        self._arm_name = config['arm']
+        self._control_ips = config['controlips']
+
+        self._handle = c_long(-1)
+        self._driver = None
+        self._driver_lock = threading.Lock()
+
+        self._status_condition = threading.Condition()
+        self._command_lock = threading.Lock()
+
+        self._camera_serial = config['serial']
+        self._camera_model = 'unknown'
+
+        self._temperature = 0
+        self._temperature_locked = False
+        self._target_temperature = config['temperature']
+
+        # Temperature limits: loaded during init
+        self._min_temperature = 0
+        self._max_temperature = 0
+
+        # CCD size: loaded during init
+        self._readout_width = 0
+        self._readout_height = 0
+
+        # Shutter enabled (opens during exposures), or remains closed
+        self._shutter_enabled = False
+
+        self._exposure_time = config['exposure']
+        self._exposure_delay = config['delay']
+
+        # Limit and number of frames acquired during the next sequence
+        # Set to 0 to run continuously
+        self._sequence_frame_limit = 0
+
+        # Number of frames acquired this sequence
+        self._sequence_frame_count = 0
+
+        # If non-None, time that the last pre-exposure delay was started
+        self._sequence_exposure_delay_start_time = None
+
+        # Time that the latest frame in the exposure was started
+        self._sequence_exposure_start_time = datetime.datetime.utcnow()
+
+        # Information for building the output filename
+        self._output_directory = pathlib.Path(config['outputpath'])
+        self._output_frame_prefix = config['outputprefix']
+
+        # Persistent frame counters
+        self._counter_filename = config['expcountlog']
+        try:
+            with open(self._counter_filename, 'r') as infile:
+                data = json.load(infile)
+                self._exposure_count = data['exposure_count']
+                self._exposure_count_reference = data['exposure_reference']
+                self._shutter_count = data['shutter_count']
+                self._shutter_count_reference = data['shutter_reference']
+        except Exception:
+            now = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+            self._exposure_count = 0
+            self._exposure_count_reference = now
+            self._shutter_count = 0
+            self._shutter_count_reference = now
+
+        # Thread that runs the exposure sequence
+        # Initialized by start() method
+        self._acquisition_thread = None
+
+        # Signal that the exposure sequence should be terminated
+        # at end of the current frame
+        self._stop_acquisition = False
+
+        # Condition to support cancellation of the pre-exposure delay
+        self._exposure_delay_condition = threading.Condition()
+
+        # Thread for polling camera status
+        status_thread = threading.Thread(target=self.__poll_camera_status)
+        status_thread.daemon = True
+        status_thread.start()
+
+    def __poll_camera_status(self):
+        """Background thread that polls the camera status"""
+        while True:
+            # Query temperature
+            with self._driver_lock:
+                if self._driver is not None:
+                    # Query temperature status
+                    temp = c_double()
+                    self._driver.FLIGetTemperature(self._handle, byref(temp))
+                    self._temperature = temp.value
+                    temp_delta = abs(self._temperature - self._target_temperature)
+                    self._temperature_locked = temp_delta < 0.5
+                else:
+                    self._status = CameraStatus.Disabled
+
+            time.sleep(STATUS_QUERY_DELAY)
+
+    def __set_target_temperature(self, target_temperature):
+        """Set the camera temperature
+           Returns True on success
+        """
+
+        with self._driver_lock:
+            if self._driver is None:
+                return False
+
+            status = self._driver.FLISetTemperature(self._handle, c_double(target_temperature))
+            if status != 0:
+                print('failed to set temperature to {} with status {}'.format(target_temperature,
+                                                                              status))
+                return False
+
+            self._target_temperature = target_temperature
+
+            return status == 0
+
+    def __set_shutter(self, enabled):
+        """Set the shutter to open automatically or stay closed
+           Returns True on success
+        """
+        with self._driver_lock:
+            value = c_long(0 if enabled else 1)
+            status = self._driver.FLISetFrameType(self._handle, value)
+            if status == 0:
+                self._shutter_enabled = enabled
+            else:
+                mode = 'auto' if enabled else 'closed'
+                print('failed to set shutter {} with status {}'.format(mode, status))
+            return status == 0
+
+    def __set_exposure_time(self, exposure_seconds):
+        """Sets the given exposure time in seconds
+           Returns True on success
+        """
+        with self._driver_lock:
+            exposure_ms = int(exposure_seconds * 1000)
+            status = self._driver.FLISetExposureTime(self._handle, c_long(exposure_ms))
+            if status == 0:
+                self._exposure_time = exposure_seconds
+            else:
+                print('failed to set exposure ({}s) with status {}'.format(
+                    exposure_seconds, status))
+        return status == 0
+
+    def __run_exposure_sequence(self):
+        """Worker thread that acquires frames and their times.
+           Tagged frames are pushed to the acquisition queue
+           for further processing on another thread"""
+        try:
+            pixel_count = self._readout_width * self._readout_height
+            while not self._stop_acquisition:
+                framedata = bytearray(pixel_count * 2)
+
+                # Delay before starting exposures
+                if self._exposure_delay > 0:
+                    self._sequence_exposure_delay_start_time = datetime.datetime.utcnow()
+                    with self._exposure_delay_condition:
+                        self._exposure_delay_condition.wait(self._exposure_delay)
+
+                    self._sequence_exposure_delay_start_time = None
+                    if self._stop_acquisition:
+                        break
+
+                with self._driver_lock:
+                    start_time = datetime.datetime.utcnow()
+                    status = self._driver.FLIExposeFrame(self._handle)
+                if status != 0:
+                    print('exposure sequence: failed to start acquisition with status ' + \
+                          str(status))
+                    log.error(self._log_table, 'Failed to start exposure sequence (' \
+                        + str(status) + ')')
+                    break
+
+                self._sequence_exposure_start_time = start_time
+
+                while True:
+                    timeleft = c_long()
+                    status = self._driver.FLIGetExposureStatus(self._handle, byref(timeleft))
+                    print(status, timeleft.value)
+                    if status != 0 or timeleft.value == 0:
+                        break
+                    time.sleep(timeleft.value / 1000.)
+
+                if status != 0:
+                    print('exposure sequence: waiting failed with status ' + str(status))
+                    log.error(self._log_table, 'Failed to wait for acquisition (' \
+                        + str(status) + ')')
+                    break
+
+                end_time = datetime.datetime.utcnow()
+                cdata = (c_uint16 * pixel_count).from_buffer(framedata)
+                for row in range(self._readout_height):
+                    offset = row * self._readout_width * sizeof(c_uint16)
+                    status = self._driver.FLIGrabRow(self._handle, byref(cdata, offset),
+                                                     self._readout_width)
+                    if status != 0:
+                        break
+
+                if status != 0:
+                    if not self._stop_acquisition:
+                        print('exposure sequence: failed to get acquired data with status ' + \
+                            str(status))
+                        log.error(self._log_table, 'Failed to query frame data (' \
+                            + str(status) + ')')
+                    break
+
+                self._exposure_count += 1
+                if self._shutter_enabled:
+                    self._shutter_count += 1
+
+                # Save updated counts to disk
+                with open(self._counter_filename, 'w') as outfile:
+                    json.dump({
+                        'exposure_count': self._exposure_count,
+                        'exposure_reference': self._exposure_count_reference,
+                        'shutter_count': self._shutter_count,
+                        'shutter_reference': self._shutter_count_reference
+                    }, outfile)
+
+                # Build metadata list
+                shutter = 'AUTO' if self._shutter_enabled else  'CLOSED'
+
+                header = [
+                    (None, None, None),
+                    ('COMMENT', ' ---                DATE/TIME                --- ', ''),
+                    ('DATE-OBS', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                     '[UTC] date that exposure was triggered'),
+                    ('DATE-END', end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                     '[UTC] date that data was received by PC'),
+                    ('EXPTIME', float(self._exposure_time), '[s] exposure time'),
+                    ('TIME-SRC', 'NTP', 'times are measured using NTP-synced PC clock'),
+                    (None, None, None),
+                    ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
+                    ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
+                    ('CAMERA', self._camera_model + ' ({})'.format(self._camera_serial),
+                     'camera model and serial number'),
+                    ('INSTRARM', self._arm_name, 'red or blue arm of the instrument'),
+                    ('CCD-TEMP', round(self._temperature, 2),
+                     '[deg c] CCD temperature at end of exposure'),
+                    ('SET-TEMP', self._target_temperature, '[deg c] CCD temperature set point'),
+                    ('TEMP-LCK', self._temperature_locked,
+                     'CCD temperature is locked to set point'),
+                    ('CCD-XBIN', 1, '[px] x binning'),
+                    ('CCD-YBIN', 1, '[px] y binning'),
+                    ('SHUTTER', shutter, 'shutter mode'),
+                    ('IMAG-RGN', '[1:{},1:{}]'.format(self._readout_width, self._readout_height),
+                     '[x1:x2,y1:y2] image region (image coords)'),
+                    ('EXPCNT', self._exposure_count, 'running exposure count since EXPCREF'),
+                    ('EXPCREF', self._exposure_count_reference,
+                     'date the exposure counter was reset'),
+                    ('SHTRCNT', self._shutter_count, 'running shutter count since SHTRCREF'),
+                    ('SHTRCREF', self._shutter_count_reference,
+                     'date the shutter counter was reset'),
+                ]
+
+                # pylint: disable=no-member
+                shape = (self._readout_height, self._readout_width)
+                data = numpy.frombuffer(framedata, dtype=numpy.uint16).reshape(shape)
+                # pylint: enable=no-member
+                hdu = fits.PrimaryHDU(data)
+
+                # Using Card and append() to force comment cards to be placed inline
+                for h in header:
+                    hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
+
+                # Save errors shouldn't interfere with preview updates, so we use a separate
+                # try/catch
+                try:
+                    filename = self._output_frame_prefix + \
+                               '-{:08d}.fits'.format(self._exposure_count)
+                    path = str(self._output_directory / filename)
+
+                    # Simulate an atomic write by writing to a temporary file then renaming
+                    hdu.writeto(path + '.tmp', overwrite=True)
+                    shutil.move(path + '.tmp', path)
+                    print('Saving temporary frame: ' + filename)
+
+                except Exception as e:
+                    self._stop_acquisition = True
+                    print('Failed to save temporary frame: ' + str(e))
+                    log.error(self._log_table, 'Failed to save temporary frame (' \
+                                          + str(e) + ')')
+
+                # Hand frame over to the pipeline
+                # This may block if the pipeline is busy
+                try:
+                    with daemons.rasa_pipeline.connect(PIPELINE_HANDOVER_TIMEOUT) as pipeline:
+                        pipeline.notify_frame(self._arm_name, path)
+                except Exception as e:
+                    self._stop_acquisition = True
+                    print('Failed to hand frame to pipeline: ' + str(e))
+                    log.error(self._log_table, 'Failed to hand frame to pipeline (' + str(e) + ')')
+
+                # Continue exposure sequence?
+                self._sequence_frame_count += 1
+                if self._sequence_frame_limit > 0 and \
+                        self._sequence_frame_count >= self._sequence_frame_limit:
+                    self._stop_acquisition = True
+        finally:
+            print('exposure sequence: complete')
+            log.info(self._log_table, 'Exposure sequence complete')
+            self._status = CameraStatus.Idle
+
+    @Pyro4.expose
+    def set_target_temperature(self, temperature):
+        """Set the target camera temperature"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if temperature < self._min_temperature or temperature > self._max_temperature:
+                return CommandStatus.TemperatureOutsideLimits
+
+            if not self.__set_target_temperature(temperature):
+                return CommandStatus.Failed
+
+            log.info(self._log_table, 'Target temperature set to ' + str(temperature))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def report_status(self):
+        """Returns a dictionary containing the current camera state"""
+        data = {'state': self._status}
+        if self._status != CameraStatus.Disabled:
+            # Estimate the current frame progress based on the time delta
+            exposure_progress = 0
+            delay_progress = 0
+            if self._status == CameraStatus.Acquiring:
+                if self._sequence_exposure_delay_start_time:
+                    data['state'] = CameraStatus.Waiting
+                    delta = datetime.datetime.utcnow() - self._sequence_exposure_delay_start_time
+                    delay_progress = delta.total_seconds()
+                else:
+                    delta = datetime.datetime.utcnow() - self._sequence_exposure_start_time
+                    exposure_progress = delta.total_seconds()
+                    if exposure_progress > self._exposure_time:
+                        data['state'] = CameraStatus.Reading
+                        exposure_progress = 0
+
+            data.update({
+                'temperature': self._temperature,
+                'temperature_locked': self._temperature_locked,
+                'target_temperature': self._target_temperature,
+                'shutter_enabled': self._shutter_enabled,
+                'exposure_time': self._exposure_time,
+                'exposure_progress': exposure_progress,
+                'delay_time': self._exposure_delay,
+                'delay_progress': delay_progress,
+                'sequence_frame_limit': self._sequence_frame_limit,
+                'sequence_frame_count': self._sequence_frame_count,
+            })
+        return data
+
+    @Pyro4.expose
+    def initialize(self):
+        """Connects to the camera driver"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status != CameraStatus.Disabled:
+                return CommandStatus.CameraNotUninitialized
+
+            self._status = CameraStatus.Initializing
+            print('initializing driver')
+
+            driver = CDLL('libfli.so')
+            try:
+                # Enumerate cameras to find target
+                handle, model = open_device(driver, self._camera_serial)
+                if handle.value < 0:
+                    print('camera with serial {} was not found'.format(self._camera_serial))
+                    return CommandStatus.CameraNotFound
+
+                # Query detector size
+                left = c_long()
+                top = c_long()
+                right = c_long()
+                bottom = c_long()
+                status = driver.FLIGetVisibleArea(handle, byref(left), byref(top),
+                                                  byref(right), byref(bottom))
+                if status != 0:
+                    return CommandStatus.Failed
+
+                # Set default shutter
+                shutter = c_long(0 if self._shutter_enabled else 1)
+                status = driver.FLISetFrameType(handle, shutter)
+                if status != 0:
+                    print('failed to set shutter with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                # Set default exposure time
+                exposure_ms = int(self._exposure_time * 1000)
+                status = driver.FLISetExposureTime(handle, c_long(exposure_ms))
+                if status != 0:
+                    print('failed to set default exposure time with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                # Set default temperature
+                status = driver.FLISetTemperature(handle, c_double(self._target_temperature))
+                if status != 0:
+                    print('failed to set default target temperature with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                # Set default binning and readout
+                status = driver.FLISetHBin(handle, c_long(1))
+                if status != 0:
+                    print('failed to set horizontal binning with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                status = driver.FLISetVBin(handle, c_long(1))
+                if status != 0:
+                    print('failed to set vertical binning with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                # Imaging area
+                visible_tl_x = c_long()
+                visible_tl_y = c_long()
+                visible_br_x = c_long()
+                visible_br_y = c_long()
+                status = driver.FLIGetVisibleArea(handle, byref(visible_tl_x), byref(visible_tl_y),
+                                                  byref(visible_br_x), byref(visible_br_y))
+                if status != 0:
+                    print('failed to query visible area with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                # Set default readout to the visible area only
+                status = driver.FLISetImageArea(handle, visible_tl_x, visible_tl_y,
+                                                visible_br_x, visible_br_y)
+                if status != 0:
+                    print('failed to set default readout area with status {}'.format(status))
+                    return CommandStatus.Failed
+
+                with self._driver_lock:
+                    self._driver = driver
+                    self._handle = handle
+                    self._camera_model = model
+
+                    # Specified in the camera documentation
+                    self._min_temperature = -55
+                    self._max_temperature = 45
+
+                    self._readout_width = visible_br_x.value - visible_tl_x.value
+                    self._readout_height = visible_br_y.value - visible_tl_y.value
+
+                    self._status = CameraStatus.Idle
+                    print('camera {} ({}) initialized'.format(self._camera_model,
+                                                              self._camera_serial))
+
+                return CommandStatus.Succeeded
+            finally:
+                # Clean up on failure
+                if self._status != CameraStatus.Idle:
+                    if driver is not None and handle.value >= 0:
+                        driver.FLIClose(handle)
+                    self._status = CameraStatus.Disabled
+                    log.error(self._log_table, 'Failed to initialize camera')
+                else:
+                    log.info(self._log_table, 'Initialized camera')
+
+    @Pyro4.expose
+    def configure(self, params):
+        """Set camera configuration to the requested state
+           params should be a dictionary with the following keys:
+              temperature: Temperature set point
+              shutter: Enable the shutter (True/False)
+              delay: Pre-exposure delay in seconds
+              exposure: Exposure time in seconds
+              window: Tuple of (binx, biny, x, y, width, height)
+           Any properties not specified in params will be reset to its default
+
+           The params dictionary should be validated using the
+           schema returned by the configure_validation_schema helper
+        """
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            # Reset cooling
+            temperature = params.get('temperature', self._config['temperature'])
+            if not self.__set_target_temperature(temperature):
+                return CommandStatus.Failed
+
+            log.info(self._log_table, 'Target temperature set to ' + str(temperature))
+
+            # Reset shutter
+            shutter = params.get('shutter', False)
+            if not self.__set_shutter(shutter):
+                return CommandStatus.Failed
+
+            log.info(self._log_table, 'Shutter set to ' + ('auto' if shutter else 'closed'))
+
+            # Reset exposure delay
+            self._exposure_delay = params.get('delay', self._config['delay'])
+
+            log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(self._exposure_delay))
+
+            # Reset exposure time
+            exposure = params.get('exposure', self._config['exposure'])
+            if not self.__set_exposure_time(exposure):
+                return CommandStatus.Failed
+
+            log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(exposure))
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def set_shutter(self, enabled):
+        """Enable or disable the shutter"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            if not self.__set_shutter(enabled):
+                return CommandStatus.Failed
+
+            log.info(self._log_table, 'Shutter set to ' + ('auto' if enabled else 'closed'))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def set_exposure(self, seconds):
+        """Set the exposure time in seconds"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            if not self.__set_exposure_time(seconds):
+                return CommandStatus.Failed
+
+            log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(seconds))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def set_exposure_delay(self, seconds):
+        """Set the pre-exposure delay in seconds"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            self._exposure_delay = seconds
+
+            log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(seconds))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def shutdown(self):
+        """Disconnects from the camera driver"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            # Complete the current exposure
+            if self._acquisition_thread is not None:
+                with self._driver_lock:
+                    self._driver.FLICancelExposure(self._handle)
+
+                print('shutdown: waiting for acquisition to complete')
+                self._stop_acquisition = True
+                self._acquisition_thread.join()
+
+            with self._driver_lock:
+                print('shutdown: disconnecting driver')
+                self._driver.FLIClose(self._handle)
+                self._driver = None
+
+            log.info(self._log_table, 'Shutdown camera')
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def start_sequence(self, count):
+        """Starts an exposure sequence with a set number of frames, or 0 to run until stopped"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            print('starting exposure sequence')
+            count_msg = 'until stopped'
+            if count == 1:
+                count_msg = '1 frame'
+            elif count > 1:
+                count_msg = str(count) + ' frames'
+
+            log.info(self._log_table, 'Starting exposure sequence (' + count_msg + ')')
+            self._sequence_frame_limit = count
+            self._sequence_frame_count = 0
+            self._stop_acquisition = False
+            self._acquisition_thread = threading.Thread(target=self.__run_exposure_sequence)
+            self._acquisition_thread.daemon = False
+            self._acquisition_thread.start()
+            self._status = CameraStatus.Acquiring
+
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def stop_sequence(self):
+        """Stops any active exposure sequence"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        if self._status == CameraStatus.Disabled:
+            return CommandStatus.CameraNotInitialized
+
+        # Note that the Waiting and Reading statuses are artificial
+        # self._status stays as CameraStatus.Acquiring during both of these
+        if self._status != CameraStatus.Acquiring:
+            return CommandStatus.CameraNotAcquiring
+
+        self._status = CameraStatus.Aborting
+        print('aborting exposure sequence')
+        log.info(self._log_table, 'Aborting exposure sequence')
+        with self._driver_lock:
+            self._driver.FLICancelExposure(self._handle)
+
+        self._sequence_frame_count = 0
+        self._stop_acquisition = True
+
+        with self._exposure_delay_condition:
+            self._exposure_delay_condition.notify_all()
+
+        return CommandStatus.Succeeded
+
+if __name__ == '__main__':
+    description = 'Camera control daemon'
+    parser = argparse.ArgumentParser(description=description)
+    parser.add_argument('camera', choices=CONFIG.keys(), help='Select a camera')
+    args = parser.parse_args()
+    cam_config = CONFIG[args.camera]
+    cam_config['daemon'].launch(CameraDaemon(cam_config))

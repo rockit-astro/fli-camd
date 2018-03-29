@@ -1,0 +1,229 @@
+#!/usr/bin/env python3.4
+#
+# This file is part of rasa-camd.
+#
+# rasa-camd is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# rasa-camd is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with rasa-camd.  If not, see <http://www.gnu.org/licenses/>.
+
+"""Daemon process for managing one of the cameras"""
+
+# pylint: disable=invalid-name
+# pylint: disable=broad-except
+
+import os
+import sys
+import time
+import Pyro4
+from warwick.observatory.common import daemons
+from warwick.rasa.camera import CommandStatus, CameraStatus
+
+# Set automatically when generating RPM package
+SOFTWARE_VERSION = 'UNKNOWN'
+
+CAMERAS = 'rasa'
+SCRIPT_NAME = os.path.basename(sys.argv[0])
+sys.excepthook = Pyro4.util.excepthook
+
+DAEMONS = {
+    'rasa': daemons.rasa_camera,
+}
+
+FMT_GREEN = u'\033[92m'
+FMT_RED = u'\033[91m'
+FMT_CYAN = u'\033[96m'
+FMT_YELLOW = u'\033[93m'
+FMT_BOLD = u'\033[1m'
+FMT_CLEAR = u'\033[0m'
+
+def run_command(daemon, command, args):
+    """Prints the message associated with a status code and returns the code"""
+    try:
+        ret = command(daemon, args)
+    except KeyboardInterrupt:
+        # ctrl-c terminates the running command
+        ret = stop(daemon, args)
+
+        # Report successful stop
+        if ret == 0:
+            ret = -100
+    except Pyro4.errors.CommunicationError:
+        ret = -101
+
+    # Print message associated with error codes, except for -1 (error handled locally)
+    if ret != -1 and ret != 0:
+        print(CommandStatus.message(ret))
+    elif ret != -1 and ret != 0:
+        print('Returned unknown status code: {0}'.format(ret))
+    return ret
+
+def status(daemon, _):
+    """Reports the current camera status"""
+    with daemon.connect() as camd:
+        data = camd.report_status()
+
+    state_desc = CameraStatus.label(data['state'])
+    if data['state'] == CameraStatus.Acquiring:
+        progress = '{:.1f} / {:.1f}s'.format(data['exposure_progress'], data['exposure_time'])
+        state_desc += ' (' + FMT_BOLD + progress + FMT_CLEAR + ')'
+    elif data['state'] == CameraStatus.Waiting:
+        progress = '{:.1f} / {:.1f}s'.format(data['delay_progress'], data['delay_time'])
+        state_desc += ' (' + FMT_BOLD + progress + FMT_CLEAR + ')'
+
+    # Camera is disabled
+    print('   Camera is {}'.format(state_desc))
+    if data['state'] == CameraStatus.Disabled:
+        return 0
+
+    if data['state'] > CameraStatus.Idle:
+        if data['sequence_frame_limit'] > 0:
+            print('   Acquiring frame ' + FMT_BOLD + str(data['sequence_frame_count'] + 1) + \
+                  ' / ' + str(data['sequence_frame_limit']) + FMT_CLEAR)
+        else:
+            print('   Acquiring ' + FMT_BOLD + 'UNTIL STOPPED' + FMT_CLEAR)
+
+    temperature_status = ''
+    temperature_fmt = FMT_BOLD + FMT_RED
+    if data['temperature_locked']:
+        temperature_status = FMT_BOLD + FMT_GREEN + 'LOCKED' + FMT_CLEAR
+        temperature_fmt = FMT_BOLD + FMT_GREEN
+    else:
+        temperature_status = FMT_BOLD + 'LOCKING ON {:.0f}\u00B0C'.format(
+            data['target_temperature']) + FMT_CLEAR
+
+    print('   Temperature is ' + temperature_fmt + '{:.0f}'.format(data['temperature']) + \
+          '\u00B0C' + FMT_CLEAR + ' (' + temperature_status + ')')
+
+    shutter_mode = FMT_GREEN + 'AUTO' if data['shutter_enabled'] else FMT_RED + 'DARK'
+    print('   Shutter mode is ' + FMT_BOLD + shutter_mode + FMT_CLEAR)
+
+    exposure_label = FMT_BOLD + '{:.2f} s'.format(data['exposure_time']) + FMT_CLEAR
+    if data['delay_time'] > 0:
+        exposure_label += ' (with ' + FMT_BOLD + '{:.2f} s'.format(data['delay_time']) + FMT_CLEAR
+        exposure_label += ' delay)'
+
+    print('   Exposure time is ' + exposure_label)
+    return 0
+
+def set_temperature(daemon, args):
+    """Set the camera temperature"""
+    if len(args) == 1:
+        temp = int(args[0])
+        with daemon.connect() as camd:
+            return camd.set_target_temperature(temp)
+    print('usage: {} [{}] temperature <degrees>'.format(SCRIPT_NAME, CAMERAS))
+    return -1
+
+def set_exposure(daemon, args):
+    """Set the camera exposure time"""
+    if len(args) == 1:
+        exposure = float(args[0])
+        with daemon.connect() as camd:
+            return camd.set_exposure(exposure)
+    print('usage: {} [{}] exposure <seconds>'.format(SCRIPT_NAME, CAMERAS))
+    return -1
+
+def set_exposure_delay(daemon, args):
+    """Set the camera pre-exposure delay"""
+    if len(args) == 1:
+        delay = float(args[0])
+        with daemon.connect() as camd:
+            return camd.set_exposure_delay(delay)
+    print('usage: {} [{}] delay <seconds>'.format(SCRIPT_NAME, CAMERAS))
+    return -1
+
+def set_shutter(daemon, args):
+    """Set the camera shutter mode"""
+    if len(args) == 1 and (args[0] == 'auto' or args[0] == 'dark'):
+        enabled = args[0] == 'auto'
+        with daemon.connect() as camd:
+            return camd.set_shutter(enabled)
+    print('usage: {} [{}] shutter [auto|dark]'.format(SCRIPT_NAME, CAMERAS))
+    return -1
+
+def start(daemon, args):
+    """Starts an exposure sequence"""
+    if len(args) == 1:
+        try:
+            count = 0 if args[0] == 'continuous' else int(args[0])
+            if args[0] == 'continuous' or count > 0:
+                with daemon.connect() as camd:
+                    return camd.start_sequence(count)
+        except Exception:
+            print('error: invalid exposure count:', args[0])
+            return -1
+    print('usage: {} [{}] start (continuous|<count>)'.format(SCRIPT_NAME, CAMERAS))
+    return -1
+
+def stop(daemon, _):
+    """Stops any active camera exposures"""
+    with daemon.connect() as camd:
+        return camd.stop_sequence()
+
+def initialize(daemon, _):
+    """Enables the camera driver"""
+    # Initialization can take more than 5 sec, so bump timeout to 10.
+    with daemon.connect(10) as camd:
+        return camd.initialize()
+
+def shutdown(daemon, _):
+    """Disables the camera drivers"""
+    with daemon.connect() as camd:
+        return camd.shutdown()
+
+def reboot(daemon, _):
+    """Reboots the camera driver"""
+    shutdown(daemon, _)
+    time.sleep(5)
+    return initialize(daemon, _)
+
+def print_usage():
+    """Prints the utility help"""
+    print('usage: {} [{}] <command> [<args>]'.format(SCRIPT_NAME, CAMERAS))
+    print()
+    print('general commands:')
+    print('   status       print a human-readable summary of the camera status')
+    print('   exposure     set exposure time in seconds')
+    print('   delay        set pre-exposure delay in seconds')
+    print('   shutter      set shutter mode')
+    print('   start        start an exposure sequence')
+    print()
+    print('engineering commands:')
+    print('   init         initialize the camera driver')
+    print('   temperature  set target temperature and enable cooling')
+    print('   kill         disconnect from camera driver')
+    print('   reboot       kill and reinitialize the camera driver')
+    print()
+
+    return 0
+
+if __name__ == '__main__':
+    if len(sys.argv) < 3:
+        sys.exit(print_usage())
+
+    commands = {
+        'temperature': set_temperature,
+        'exposure': set_exposure,
+        'delay': set_exposure_delay,
+        'shutter': set_shutter,
+        'status': status,
+        'start': start,
+        'stop': stop,
+        'init': initialize,
+        'kill': shutdown,
+        'reboot': reboot
+    }
+
+    if sys.argv[1] not in DAEMONS or sys.argv[2] not in commands:
+        sys.exit(print_usage())
+
+    sys.exit(run_command(DAEMONS[sys.argv[1]], commands[sys.argv[2]], sys.argv[3:]))

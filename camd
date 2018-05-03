@@ -346,7 +346,7 @@ class CameraDaemon:
                     ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
                     ('CAMERA', self._camera_model + ' ({})'.format(self._camera_serial),
                      'camera model and serial number'),
-                    ('INSTRARM', self._arm_name, 'red or blue arm of the instrument'),
+                    ('INSTRARM', self._arm_name, 'camera identifier'),
                     ('CCD-TEMP', round(self._temperature, 2),
                      '[deg c] CCD temperature at end of exposure'),
                     ('SET-TEMP', self._target_temperature, '[deg c] CCD temperature set point'),

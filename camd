@@ -282,10 +282,13 @@ class CameraDaemon:
 
                 self._sequence_exposure_start_time = start_time
 
+                # Wait a short time for the camera to definitely start exposing
+                # This works around a race condition where FLIGetExposureStatus returns 0
+                time.sleep(0.05)
+
                 while True:
                     timeleft = c_long()
                     status = self._driver.FLIGetExposureStatus(self._handle, byref(timeleft))
-                    print(status, timeleft.value)
                     if status != 0 or timeleft.value == 0:
                         break
                     time.sleep(timeleft.value / 1000.)

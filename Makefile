@@ -5,7 +5,7 @@ RPMBUILD = rpmbuild --define "_topdir %(pwd)/build" \
         --define "_sourcedir %(pwd)"
 
 GIT_VERSION = $(shell git name-rev --name-only --tags --no-undefined HEAD 2>/dev/null || echo git-`git rev-parse --short HEAD`)
-SERVER_VERSION=$(shell awk '/Version:/ { print $$2; }' onemetre-camera-server.spec)
+SERVER_VERSION=$(shell awk '/Version:/ { print $$2; }' rasa-camera-server.spec)
 
 all:
 	mkdir -p build

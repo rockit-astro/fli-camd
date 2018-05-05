@@ -1,5 +1,5 @@
 Name:      rasa-camera-server
-Version:   2.1.4
+Version:   2.1.5
 Release:   0
 Url:       https://github.com/warwick-one-metre/rasa-camd
 Summary:   Camera control server for the RASA prototype telescope.
@@ -27,6 +27,7 @@ mkdir -p %{buildroot}%{_udevrulesdir}
 %{__install} %{_sourcedir}/camd %{buildroot}%{_bindir}
 %{__install} %{_sourcedir}/rasa_camd.service %{buildroot}%{_unitdir}
 %{__install} %{_sourcedir}/10-fliusb.rules %{buildroot}%{_udevrulesdir}
+%{__install} %{_sourcedir}/10-rasa-camera-timer.rules %{buildroot}%{_udevrulesdir}
 
 %post
 %systemd_post rasa_camd.service
@@ -42,6 +43,7 @@ mkdir -p %{buildroot}%{_udevrulesdir}
 %{_bindir}/camd
 %defattr(0644,root,root,-)
 %{_udevrulesdir}/10-fliusb.rules
+%{_udevrulesdir}/10-rasa-camera-timer.rules
 %{_unitdir}/rasa_camd.service
 
 %changelog

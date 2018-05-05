@@ -47,7 +47,12 @@ from warwick.observatory.common import (
     IP,
     TryLock)
 from warwick.observatory.common.helpers import pyro_client_matches
-from warwick.rasa.camera import CommandStatus, CameraStatus
+from warwick.rasa.camera import (
+    CommandStatus,
+    CameraStatus,
+    GPSTimer,
+    GPSFixType,
+    GPSLocalCheckStatus)
 
 daemons.observatory_log.host = '127.0.0.1'
 
@@ -58,6 +63,8 @@ CONFIG = {
     'rasa': {
         'daemon': daemons.rasa_camera,
         'serial': 'ML6314917',
+        'timerport': '/dev/gpstimer',
+        'timerbaud': 9600,
         'temperature': -20,
         'exposure': 1,
         'delay': 0,
@@ -109,6 +116,12 @@ class CameraDaemon:
         self._log_table = config['logtable']
         self._arm_name = config['arm']
         self._control_ips = config['controlips']
+
+        if config['timerport']:
+            self._timer = GPSTimer(config['timerport'], config['timerbaud'],
+                                   config['logtable'])
+        else:
+            self._timer = None
 
         self._handle = c_long(-1)
         self._driver = None
@@ -258,6 +271,9 @@ class CameraDaemon:
         try:
             pixel_count = self._readout_width * self._readout_height
             while not self._stop_acquisition:
+                if self._timer:
+                    self._timer.clear_last_trigger()
+
                 framedata = bytearray(pixel_count * 2)
 
                 # Delay before starting exposures
@@ -308,6 +324,7 @@ class CameraDaemon:
                     if status != 0:
                         break
 
+                read_end_time = datetime.datetime.utcnow()
                 if status != 0:
                     if not self._stop_acquisition:
                         print('exposure sequence: failed to get acquired data with status ' + \
@@ -332,15 +349,74 @@ class CameraDaemon:
                 # Build metadata list
                 shutter = 'AUTO' if self._shutter_enabled else  'CLOSED'
 
+                obs_time = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+                time_src = 'NTP'
+                time_src_comment = 'DATE-OBS is a NTP-synced PC clock timestamp'
+                time_chk = gps_fix = gps_sats = gps_beg = gps_end = None
+                gps_tsst = 'DISABLED'
+                if self._timer:
+                    trigger = self._timer.last_trigger()
+                    status = self._timer.report_status()
+                    if status['last_check_status'] != GPSLocalCheckStatus.Unknown:
+                        time_chk = round(status['last_check_delta'], 1)
+                    gps_fix = GPSFixType.Labels[status['fix_type']]
+                    gps_sats = status['satellites']
+
+                    if self._shutter_enabled:
+                        gps_tsst = 'MISSING'
+
+                    # Trigger signals are only generated when the shutter is enabled
+                    use_trigger = trigger[0] != None and trigger[1] != None \
+                        and self._shutter_enabled
+
+                    if use_trigger:
+                        # Sanity check the trigger times
+                        #   - exposure lengths must agree to within 1ms
+                        #   - exposure start times (corrected for clock drift)
+                        #     must agree to within 250ms
+                        trigger_length = (trigger[1] - trigger[0]).total_seconds()
+                        exposure_delta = trigger_length - float(self._exposure_time)
+                        start_delta = (trigger[0] - start_time).total_seconds() + \
+                            status['last_check_delta']
+
+                        if abs(exposure_delta) > 0.001 or abs(start_delta) > 0.25:
+                            use_trigger = False
+                            gps_tsst = 'INVALID'
+                            print('Trigger for exposure {} failed validation:'.format(
+                                self._exposure_count))
+                            print('   GPS Start:', trigger[0].strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                            print('   GPS End:', trigger[1].strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                            print('   PC Start:', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                            print('   Check Delta:', status['last_check_delta'])
+                            print('   Exposure delta: {:.6f}'.format(exposure_delta))
+                            print('   Start delta: {:.3f}'.format(start_delta))
+
+                    if use_trigger:
+                        time_src = 'GPS'
+                        time_src_comment = 'DATE-OBS is a hardware-triggered GPS timestamp'
+                        gps_beg = trigger[0].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+                        gps_end = trigger[1].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+                        obs_time = gps_beg
+                        gps_tsst = 'VALID'
+
                 header = [
                     (None, None, None),
                     ('COMMENT', ' ---                DATE/TIME                --- ', ''),
-                    ('DATE-OBS', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
-                     '[UTC] date that exposure was triggered'),
-                    ('DATE-END', end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
-                     '[UTC] date that data was received by PC'),
-                    ('EXPTIME', float(self._exposure_time), '[s] exposure time'),
-                    ('TIME-SRC', 'NTP', 'times are measured using NTP-synced PC clock'),
+                    ('DATE-OBS', obs_time, '[UTC] exposure start time from TIME-SRC'),
+                    ('TIME-SRC', time_src, time_src_comment),
+                    ('EXPTIME', float(self._exposure_time), '[s] exposure length'),
+                    ('GPS-FIX', gps_fix, 'GPS receiver fix status'),
+                    ('GPS-SATS', gps_sats, 'GPS receiver satellite count'),
+                    ('GPS-TMST', gps_tsst, 'GPS timestamp status'),
+                    ('GPS-BEG', gps_beg, '[UTC] GPS timestamp when exposure started'),
+                    ('GPS-END', gps_end, '[UTC] GPS timestamp when exposure ended'),
+                    ('PC-BEG', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                     '[UTC] local PC time of software trigger'),
+                    ('PC-RDBEG', end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                     '[UTC] local PC time when readout started'),
+                    ('PC-RDEND', read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
+                     '[UTC] local PC time when readout completed'),
+                    ('TIME-CHK', time_chk, '[s] approximate offset of PC clock from GPS'),
                     (None, None, None),
                     ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
                     ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
@@ -373,6 +449,8 @@ class CameraDaemon:
 
                 # Using Card and append() to force comment cards to be placed inline
                 for h in header:
+                    if h[0] is not None and h[1] is None:
+                        h = ('COMMENT', ' ' + h[0] + ' not available', '')
                     hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
 
                 # Save errors shouldn't interfere with preview updates, so we use a separate
@@ -467,6 +545,10 @@ class CameraDaemon:
                 'sequence_frame_limit': self._sequence_frame_limit,
                 'sequence_frame_count': self._sequence_frame_count,
             })
+
+        if self._timer:
+            data['timer'] = self._timer.report_status()
+
         return data
 
     @Pyro4.expose

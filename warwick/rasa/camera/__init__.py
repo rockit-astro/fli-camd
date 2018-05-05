@@ -19,3 +19,4 @@
 
 from .constants import CommandStatus, CameraStatus
 from .validation import configure_validation_schema
+from .gpstimer import GPSTimer, GPSFixType, GPSLocalCheckStatus

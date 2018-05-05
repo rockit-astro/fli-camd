@@ -20,12 +20,13 @@
 # pylint: disable=invalid-name
 # pylint: disable=broad-except
 
+import datetime
 import os
 import sys
 import time
 import Pyro4
 from warwick.observatory.common import daemons
-from warwick.rasa.camera import CommandStatus, CameraStatus
+from warwick.rasa.camera import CommandStatus, CameraStatus, GPSFixType, GPSLocalCheckStatus
 
 # Set automatically when generating RPM package
 SOFTWARE_VERSION = 'UNKNOWN'
@@ -81,37 +82,51 @@ def status(daemon, _):
 
     # Camera is disabled
     print('   Camera is {}'.format(state_desc))
-    if data['state'] == CameraStatus.Disabled:
-        return 0
+    if data['state'] != CameraStatus.Disabled:
 
-    if data['state'] > CameraStatus.Idle:
-        if data['sequence_frame_limit'] > 0:
-            print('   Acquiring frame ' + FMT_BOLD + str(data['sequence_frame_count'] + 1) + \
-                  ' / ' + str(data['sequence_frame_limit']) + FMT_CLEAR)
+        if data['state'] > CameraStatus.Idle:
+            if data['sequence_frame_limit'] > 0:
+                print('   Acquiring frame ' + FMT_BOLD + str(data['sequence_frame_count'] + 1) + \
+                      ' / ' + str(data['sequence_frame_limit']) + FMT_CLEAR)
+            else:
+                print('   Acquiring ' + FMT_BOLD + 'UNTIL STOPPED' + FMT_CLEAR)
+
+        temperature_status = ''
+        temperature_fmt = FMT_BOLD + FMT_RED
+        if data['temperature_locked']:
+            temperature_status = FMT_BOLD + FMT_GREEN + 'LOCKED' + FMT_CLEAR
+            temperature_fmt = FMT_BOLD + FMT_GREEN
         else:
-            print('   Acquiring ' + FMT_BOLD + 'UNTIL STOPPED' + FMT_CLEAR)
+            temperature_status = FMT_BOLD + 'LOCKING ON {:.0f}\u00B0C'.format(
+                data['target_temperature']) + FMT_CLEAR
 
-    temperature_status = ''
-    temperature_fmt = FMT_BOLD + FMT_RED
-    if data['temperature_locked']:
-        temperature_status = FMT_BOLD + FMT_GREEN + 'LOCKED' + FMT_CLEAR
-        temperature_fmt = FMT_BOLD + FMT_GREEN
+        print('   Temperature is ' + temperature_fmt + '{:.0f}'.format(data['temperature']) + \
+              '\u00B0C' + FMT_CLEAR + ' (' + temperature_status + ')')
+
+        shutter_mode = FMT_GREEN + 'AUTO' if data['shutter_enabled'] else FMT_RED + 'DARK'
+        print('   Shutter mode is ' + FMT_BOLD + shutter_mode + FMT_CLEAR)
+
+        exposure_label = FMT_BOLD + '{:.2f} s'.format(data['exposure_time']) + FMT_CLEAR
+        if data['delay_time'] > 0:
+            exposure_label += ' (with ' + FMT_BOLD + '{:.2f} s'.format(data['delay_time']) + FMT_CLEAR
+            exposure_label += ' delay)'
+
+        print('   Exposure time is ' + exposure_label)
+
+    if 'timer' in data:
+        timer = data['timer']
+        gps_label = '   GPS is ' + FMT_BOLD + FMT_GREEN + 'ONLINE' + FMT_CLEAR + ' ('
+        gps_label += FMT_BOLD + GPSFixType.Labels[timer['fix_type']] + FMT_CLEAR
+        gps_label += ' with ' + FMT_BOLD + str(timer['satellites']) + FMT_CLEAR + ' satellites)'
+        print(gps_label)
+
+        ntp_label = '   Local PC clock is ' + GPSLocalCheckStatus.label(timer['last_check_status'], True)
+        if timer['last_check_status'] != GPSLocalCheckStatus.Unknown:
+            ntp_label += ' (~' + FMT_BOLD + '{:.1f}'.format(timer['last_check_delta']) + FMT_CLEAR
+            ntp_label += ' s delta)'
+        print(ntp_label)
     else:
-        temperature_status = FMT_BOLD + 'LOCKING ON {:.0f}\u00B0C'.format(
-            data['target_temperature']) + FMT_CLEAR
-
-    print('   Temperature is ' + temperature_fmt + '{:.0f}'.format(data['temperature']) + \
-          '\u00B0C' + FMT_CLEAR + ' (' + temperature_status + ')')
-
-    shutter_mode = FMT_GREEN + 'AUTO' if data['shutter_enabled'] else FMT_RED + 'DARK'
-    print('   Shutter mode is ' + FMT_BOLD + shutter_mode + FMT_CLEAR)
-
-    exposure_label = FMT_BOLD + '{:.2f} s'.format(data['exposure_time']) + FMT_CLEAR
-    if data['delay_time'] > 0:
-        exposure_label += ' (with ' + FMT_BOLD + '{:.2f} s'.format(data['delay_time']) + FMT_CLEAR
-        exposure_label += ' delay)'
-
-    print('   Exposure time is ' + exposure_label)
+        print('   GPS is ' + FMT_BOLD + FMT_RED + 'OFFLINE' + FMT_CLEAR)
     return 0
 
 def set_temperature(daemon, args):

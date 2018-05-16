@@ -354,6 +354,8 @@ class CameraDaemon:
                 time_src_comment = 'DATE-OBS is a NTP-synced PC clock timestamp'
                 time_chk = gps_fix = gps_sats = gps_beg = gps_end = None
                 gps_tsst = 'DISABLED'
+                gps_sats = 0
+                gps_fix =  GPSFixType.Labels[GPSFixType.NoFix]
                 if self._timer:
                     trigger = self._timer.last_trigger()
                     status = self._timer.report_status()

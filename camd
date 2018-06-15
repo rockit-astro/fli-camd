@@ -54,15 +54,13 @@ from warwick.rasa.camera import (
     GPSFixType,
     GPSLocalCheckStatus)
 
-daemons.observatory_log.host = '127.0.0.1'
-
 # Set automatically when generating RPM package
 SOFTWARE_VERSION = "UNKNOWN"
 
 CONFIG = {
     'rasa': {
         'daemon': daemons.rasa_camera,
-        'serial': 'ML6314917',
+        'serial': 'ML0701018',
         'timerport': '/dev/gpstimer',
         'timerbaud': 9600,
         'temperature': -20,
@@ -315,6 +313,9 @@ class CameraDaemon:
                         + str(status) + ')')
                     break
 
+                if self._stop_acquisition:
+                    break
+
                 end_time = datetime.datetime.utcnow()
                 cdata = (c_uint16 * pixel_count).from_buffer(framedata)
                 for row in range(self._readout_height):
@@ -325,6 +326,10 @@ class CameraDaemon:
                         break
 
                 read_end_time = datetime.datetime.utcnow()
+
+                if self._stop_acquisition:
+                    break
+
                 if status != 0:
                     if not self._stop_acquisition:
                         print('exposure sequence: failed to get acquired data with status ' + \
@@ -440,7 +445,7 @@ class CameraDaemon:
                      'date the exposure counter was reset'),
                     ('SHTRCNT', self._shutter_count, 'running shutter count since SHTRCREF'),
                     ('SHTRCREF', self._shutter_count_reference,
-                     'date the shutter counter was reset'),
+                     'date the shutter counter was reset')
                 ]
 
                 # pylint: disable=no-member

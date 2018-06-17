@@ -106,9 +106,9 @@ def status(daemon, _):
         shutter_mode = FMT_GREEN + 'AUTO' if data['shutter_enabled'] else FMT_RED + 'DARK'
         print('   Shutter mode is ' + FMT_BOLD + shutter_mode + FMT_CLEAR)
 
-        exposure_label = FMT_BOLD + '{:.2f} s'.format(data['exposure_time']) + FMT_CLEAR
+        exposure_label = FMT_BOLD + '{:.3f} s'.format(data['exposure_time']) + FMT_CLEAR
         if data['delay_time'] > 0:
-            exposure_label += ' (with ' + FMT_BOLD + '{:.2f} s'.format(data['delay_time']) + FMT_CLEAR
+            exposure_label += ' (with ' + FMT_BOLD + '{:.3f} s'.format(data['delay_time']) + FMT_CLEAR
             exposure_label += ' delay)'
 
         print('   Exposure time is ' + exposure_label)

@@ -256,7 +256,8 @@ class CameraDaemon:
             exposure_ms = int(exposure_seconds * 1000)
             status = self._driver.FLISetExposureTime(self._handle, c_long(exposure_ms))
             if status == 0:
-                self._exposure_time = exposure_seconds
+                # Use milliseconds to ensure consistency after truncation
+                self._exposure_time = exposure_ms / 1000
             else:
                 print('failed to set exposure ({}s) with status {}'.format(
                     exposure_seconds, status))
@@ -411,7 +412,7 @@ class CameraDaemon:
                     ('COMMENT', ' ---                DATE/TIME                --- ', ''),
                     ('DATE-OBS', obs_time, '[UTC] exposure start time from TIME-SRC'),
                     ('TIME-SRC', time_src, time_src_comment),
-                    ('EXPTIME', float(self._exposure_time), '[s] exposure length'),
+                    ('EXPTIME', round(self._exposure_time, 3), '[s] exposure length'),
                     ('GPS-FIX', gps_fix, 'GPS receiver fix status'),
                     ('GPS-SATS', gps_sats, 'GPS receiver satellite count'),
                     ('GPS-TMST', gps_tsst, 'GPS timestamp status'),

@@ -28,3 +28,6 @@ sudo firewall-cmd --zone=public --add-port=9037/tcp --permanent
 sudo firewall-cmd --reload
 ```
 
+### Hardware Setup
+
+The camera serial number can be found by checking the `dmesg` log after connecting the camera USB.

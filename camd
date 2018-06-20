@@ -60,7 +60,7 @@ SOFTWARE_VERSION = "UNKNOWN"
 CONFIG = {
     'rasa': {
         'daemon': daemons.rasa_camera,
-        'serial': 'ML0701018',
+        'serial': 'ML0420516',
         'timerport': '/dev/gpstimer',
         'timerbaud': 9600,
         'temperature': -20,

@@ -773,9 +773,10 @@ class CameraDaemon:
 
             # Reset window
             window = params.get('window', [
-                self._visible_x1, self._visible_x2,
-                self._visible_y1, self._visible_y2
+                1, self._visible_x2 - self._visible_x1,
+                1, self._visible_y2 - self._visible_y1
             ])
+
             if len(window) != 4 or not self.__set_readout_window(window[0], window[1],
                                                                  window[2], window[3]):
                 return CommandStatus.Failed

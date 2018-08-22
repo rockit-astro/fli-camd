@@ -13,7 +13,7 @@
 # published by the Open Source Initiative.
 
 Name:           python34-warwick-rasa-camera
-Version:        1.0.2
+Version:        1.0.3
 Release:        0
 License:        GPL3
 Summary:        Common backend code for the RASA prototype camera daemon

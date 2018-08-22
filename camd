@@ -548,7 +548,7 @@ class CameraDaemon:
             self._status = CameraStatus.Idle
 
     @Pyro4.expose
-    def set_target_temperature(self, temperature):
+    def set_target_temperature(self, temperature, quiet=False):
         """Set the target camera temperature"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -566,7 +566,8 @@ class CameraDaemon:
             if not self.__set_target_temperature(temperature):
                 return CommandStatus.Failed
 
-            log.info(self._log_table, 'Target temperature set to ' + str(temperature))
+            if not quiet:
+                log.info(self._log_table, 'Target temperature set to ' + str(temperature))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
@@ -803,7 +804,7 @@ class CameraDaemon:
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def set_shutter(self, enabled):
+    def set_shutter(self, enabled, quiet=False):
         """Enable or disable the shutter"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -821,11 +822,12 @@ class CameraDaemon:
             if not self.__set_shutter(enabled):
                 return CommandStatus.Failed
 
-            log.info(self._log_table, 'Shutter set to ' + ('auto' if enabled else 'closed'))
+            if not quiet:
+                log.info(self._log_table, 'Shutter set to ' + ('auto' if enabled else 'closed'))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def set_exposure(self, seconds):
+    def set_exposure(self, seconds, quiet=False):
         """Set the exposure time in seconds"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -843,11 +845,12 @@ class CameraDaemon:
             if not self.__set_exposure_time(seconds):
                 return CommandStatus.Failed
 
-            log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(seconds))
+            if not quiet:
+                log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(seconds))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def set_exposure_delay(self, seconds):
+    def set_exposure_delay(self, seconds, quiet=False):
         """Set the pre-exposure delay in seconds"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -864,11 +867,12 @@ class CameraDaemon:
 
             self._exposure_delay = seconds
 
-            log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(seconds))
+            if not quiet:
+                log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(seconds))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def set_window(self, x1, x2, y1, y2):
+    def set_window(self, x1, x2, y1, y2, quiet=False):
         """Sets the CCD readout window in unbinned (hardware) pixels"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -886,8 +890,9 @@ class CameraDaemon:
             if not self.__set_readout_window(x1, x2, y1, y2):
                 return CommandStatus.WindowOutsideCCD
 
-            region = '[{}:{},{}:{}]'.format(x1, x2, y1, y2)
-            log.info(self._log_table, 'Window set to ' + region)
+            if not quiet:
+                region = '[{}:{},{}:{}]'.format(x1, x2, y1, y2)
+                log.info(self._log_table, 'Window set to ' + region)
             return CommandStatus.Succeeded
 
     @Pyro4.expose

@@ -139,9 +139,15 @@ class CameraDaemon:
         self._min_temperature = 0
         self._max_temperature = 0
 
-        # CCD size: loaded during init
-        self._readout_width = 0
-        self._readout_height = 0
+        # Exposured pixel area (detector coords)
+        # Loaded during initialization
+        self._visible_x1 = self._visible_x2 = 0
+        self._visible_y1 = self._visible_y2 = 0
+
+        # Current window region (detector coords)
+        # These are *inclusive* ranges, set during initialization or by user
+        self._window_x1 = self._window_x2 = 0
+        self._window_y1 = self._window_y2 = 0
 
         # Shutter enabled (opens during exposures), or remains closed
         self._shutter_enabled = False
@@ -263,12 +269,45 @@ class CameraDaemon:
                     exposure_seconds, status))
         return status == 0
 
+    def __set_readout_window(self, x1, x2, y1, y2):
+        """Sets the readout coordinates in 1-indexed inclusive ranges
+           (for compatibility with e.g. cfitsio image slices)
+           Returns True on success
+        """
+        xmax = self._visible_x2 - self._visible_x1
+        ymax = self._visible_y2 - self._visible_y1
+
+        if x1 >= x2 or y1 >= y2:
+            return False
+
+        if x1 < 1 or y1 < 1 or x2 > xmax or y2 > ymax:
+            return False
+
+        with self._driver_lock:
+            status = self._driver.FLISetImageArea(self._handle,
+                                                  c_long(self._visible_x1 + x1 - 1),
+                                                  c_long(self._visible_y1 + y1 - 1),
+                                                  c_long(self._visible_x1 + x2),
+                                                  c_long(self._visible_y1 + y2))
+            if status != 0:
+                print('failed to set default readout area with status {}'.format(status))
+                return False
+
+            self._window_x1 = x1
+            self._window_x2 = x2
+            self._window_y1 = y1
+            self._window_y2 = y2
+
+            return True
+
     def __run_exposure_sequence(self):
         """Worker thread that acquires frames and their times.
            Tagged frames are pushed to the acquisition queue
            for further processing on another thread"""
         try:
-            pixel_count = self._readout_width * self._readout_height
+            readout_width = self._window_x2 - self._window_x1 + 1
+            readout_height = self._window_y2 - self._window_y1 + 1
+            pixel_count = readout_width * readout_height
             while not self._stop_acquisition:
                 if self._timer:
                     self._timer.clear_last_trigger()
@@ -319,10 +358,10 @@ class CameraDaemon:
 
                 end_time = datetime.datetime.utcnow()
                 cdata = (c_uint16 * pixel_count).from_buffer(framedata)
-                for row in range(self._readout_height):
-                    offset = row * self._readout_width * sizeof(c_uint16)
+                for row in range(readout_height):
+                    offset = row * readout_width * sizeof(c_uint16)
                     status = self._driver.FLIGrabRow(self._handle, byref(cdata, offset),
-                                                     self._readout_width)
+                                                     readout_width)
                     if status != 0:
                         break
 
@@ -361,7 +400,7 @@ class CameraDaemon:
                 time_chk = gps_fix = gps_sats = gps_beg = gps_end = None
                 gps_tsst = 'DISABLED'
                 gps_sats = 0
-                gps_fix =  GPSFixType.Labels[GPSFixType.NoFix]
+                gps_fix = GPSFixType.Labels[GPSFixType.NoFix]
                 if self._timer:
                     trigger = self._timer.last_trigger()
                     status = self._timer.report_status()
@@ -407,6 +446,8 @@ class CameraDaemon:
                         obs_time = gps_beg
                         gps_tsst = 'VALID'
 
+                readout_width = self._window_x2 - self._window_x1 + 1
+                readout_height = self._window_y2 - self._window_y1 + 1
                 header = [
                     (None, None, None),
                     ('COMMENT', ' ---                DATE/TIME                --- ', ''),
@@ -438,8 +479,12 @@ class CameraDaemon:
                      'CCD temperature is locked to set point'),
                     ('CCD-XBIN', 1, '[px] x binning'),
                     ('CCD-YBIN', 1, '[px] y binning'),
+                    ('CCD-WIND', '[{}:{},{}:{}]'.format(
+                        self._window_x1, self._window_x2,
+                        self._window_y1, self._window_y2),
+                     '[x1:x2,y1:y2] readout window (detector coords)'),
                     ('SHUTTER', shutter, 'shutter mode'),
-                    ('IMAG-RGN', '[1:{},1:{}]'.format(self._readout_width, self._readout_height),
+                    ('IMAG-RGN', '[1:{},1:{}]'.format(readout_width, readout_height),
                      '[x1:x2,y1:y2] image region (image coords)'),
                     ('EXPCNT', self._exposure_count, 'running exposure count since EXPCREF'),
                     ('EXPCREF', self._exposure_count_reference,
@@ -450,7 +495,7 @@ class CameraDaemon:
                 ]
 
                 # pylint: disable=no-member
-                shape = (self._readout_height, self._readout_width)
+                shape = (readout_height, readout_width)
                 data = numpy.frombuffer(framedata, dtype=numpy.uint16).reshape(shape)
                 # pylint: enable=no-member
                 hdu = fits.PrimaryHDU(data)
@@ -546,6 +591,10 @@ class CameraDaemon:
                 'temperature_locked': self._temperature_locked,
                 'target_temperature': self._target_temperature,
                 'shutter_enabled': self._shutter_enabled,
+                'window': [
+                    self._window_x1, self._window_x2,
+                    self._window_y1, self._window_y2,
+                ],
                 'exposure_time': self._exposure_time,
                 'exposure_progress': exposure_progress,
                 'delay_time': self._exposure_delay,
@@ -625,19 +674,19 @@ class CameraDaemon:
                     return CommandStatus.Failed
 
                 # Imaging area
-                visible_tl_x = c_long()
-                visible_tl_y = c_long()
-                visible_br_x = c_long()
-                visible_br_y = c_long()
-                status = driver.FLIGetVisibleArea(handle, byref(visible_tl_x), byref(visible_tl_y),
-                                                  byref(visible_br_x), byref(visible_br_y))
+                visible_x1 = c_long()
+                visible_y1 = c_long()
+                visible_x2 = c_long()
+                visible_y2 = c_long()
+                status = driver.FLIGetVisibleArea(handle, byref(visible_x1), byref(visible_y1),
+                                                  byref(visible_x2), byref(visible_y2))
                 if status != 0:
                     print('failed to query visible area with status {}'.format(status))
                     return CommandStatus.Failed
 
                 # Set default readout to the visible area only
-                status = driver.FLISetImageArea(handle, visible_tl_x, visible_tl_y,
-                                                visible_br_x, visible_br_y)
+                status = driver.FLISetImageArea(handle, visible_x1, visible_y1,
+                                                visible_x2, visible_y2)
                 if status != 0:
                     print('failed to set default readout area with status {}'.format(status))
                     return CommandStatus.Failed
@@ -651,8 +700,13 @@ class CameraDaemon:
                     self._min_temperature = -55
                     self._max_temperature = 45
 
-                    self._readout_width = visible_br_x.value - visible_tl_x.value
-                    self._readout_height = visible_br_y.value - visible_tl_y.value
+                    self._visible_x1 = visible_x1.value
+                    self._visible_y1 = visible_y1.value
+                    self._visible_x2 = visible_x2.value
+                    self._visible_y2 = visible_y2.value
+                    self._window_x1 = self._window_y1 = 1
+                    self._window_x2 = self._visible_x2 - self._visible_x1
+                    self._window_y2 = self._visible_y2 - self._visible_y1
 
                     self._status = CameraStatus.Idle
                     print('camera {} ({}) initialized'.format(self._camera_model,
@@ -677,7 +731,7 @@ class CameraDaemon:
               shutter: Enable the shutter (True/False)
               delay: Pre-exposure delay in seconds
               exposure: Exposure time in seconds
-              window: Tuple of (binx, biny, x, y, width, height)
+              window: Tuple of (x1, x2, y1, y2)
            Any properties not specified in params will be reset to its default
 
            The params dictionary should be validated using the
@@ -709,6 +763,18 @@ class CameraDaemon:
                 return CommandStatus.Failed
 
             log.info(self._log_table, 'Shutter set to ' + ('auto' if shutter else 'closed'))
+
+            # Reset window
+            window = params.get('window', [
+                self._visible_x1, self._visible_x2,
+                self._visible_y1, self._visible_y2
+            ])
+            if len(window) != 4 or not self.__set_readout_window(window[0], window[1],
+                                                                 window[2], window[3]):
+                return CommandStatus.Failed
+
+            region = '[{}:{},{}:{}]'.format(window[0], window[1], window[2], window[3])
+            log.info(self._log_table, 'Window set to ' + region)
 
             # Reset exposure delay
             self._exposure_delay = params.get('delay', self._config['delay'])
@@ -787,6 +853,29 @@ class CameraDaemon:
             self._exposure_delay = seconds
 
             log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(seconds))
+            return CommandStatus.Succeeded
+
+    @Pyro4.expose
+    def set_window(self, x1, x2, y1, y2):
+        """Sets the CCD readout window in unbinned (hardware) pixels"""
+        if not pyro_client_matches(self._control_ips):
+            return CommandStatus.InvalidControlIP
+
+        with TryLock(self._command_lock) as success:
+            if not success:
+                return CommandStatus.Blocked
+
+            if self._status == CameraStatus.Disabled:
+                return CommandStatus.CameraNotInitialized
+
+            if self._status != CameraStatus.Idle:
+                return CommandStatus.CameraNotIdle
+
+            if not self.__set_readout_window(x1, x2, y1, y2):
+                return CommandStatus.WindowOutsideCCD
+
+            region = '[{}:{},{}:{}]'.format(x1, x2, y1, y2)
+            log.info(self._log_table, 'Window set to ' + region)
             return CommandStatus.Succeeded
 
     @Pyro4.expose

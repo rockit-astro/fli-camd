@@ -47,6 +47,33 @@ def configure_validation_schema(camera):
             'delay': {
                 'type': 'number',
                 'minimum': 0
+            },
+            'window': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['x1', 'x2', 'y1', 'y2'],
+                'properties': {
+                    'x1': {
+                        'type': 'number',
+                        'minimum': 1,
+                        'maximum': 8176
+                    },
+                    'x2': {
+                        'type': 'number',
+                        'minimum': 1,
+                        'maximum': 8176
+                    },
+                    'y1': {
+                        'type': 'number',
+                        'minimum': 1,
+                        'maximum': 6132
+                    },
+                    'y2': {
+                        'type': 'number',
+                        'minimum': 1,
+                        'maximum': 6132
+                    }
+                }
             }
         }
     }

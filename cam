@@ -105,7 +105,9 @@ def status(daemon, _):
 
         shutter_mode = FMT_GREEN + 'AUTO' if data['shutter_enabled'] else FMT_RED + 'DARK'
         print('   Shutter mode is ' + FMT_BOLD + shutter_mode + FMT_CLEAR)
-
+        window = '[{}:{},{}:{}]'.format(data['window'][0], data['window'][1],
+                                        data['window'][2], data['window'][3])
+        print('   Readout window is ' + FMT_BOLD + window + FMT_CLEAR)
         exposure_label = FMT_BOLD + '{:.3f} s'.format(data['exposure_time']) + FMT_CLEAR
         if data['delay_time'] > 0:
             exposure_label += ' (with ' + FMT_BOLD + '{:.3f} s'.format(data['delay_time']) + FMT_CLEAR
@@ -165,6 +167,18 @@ def set_shutter(daemon, args):
     print('usage: {} [{}] shutter [auto|dark]'.format(SCRIPT_NAME, CAMERAS))
     return -1
 
+def set_window(daemon, args):
+    """Set the camera readout window"""
+    if len(args) == 4:
+        x1 = int(args[0])
+        x2 = int(args[1])
+        y1 = int(args[2])
+        y2 = int(args[3])
+        with daemon.connect() as camd:
+            return camd.set_window(x1, x2, y1, y2)
+    print('usage: {} [{}] window <x1> <x2> <y1> <y2>'.format(SCRIPT_NAME, CAMERAS))
+    return -1
+
 def start(daemon, args):
     """Starts an exposure sequence"""
     if len(args) == 1:
@@ -210,6 +224,7 @@ def print_usage():
     print('   exposure     set exposure time in seconds')
     print('   delay        set pre-exposure delay in seconds')
     print('   shutter      set shutter mode')
+    print('   window       set readout geometry')
     print('   start        start an exposure sequence')
     print()
     print('engineering commands:')
@@ -230,6 +245,7 @@ if __name__ == '__main__':
         'exposure': set_exposure,
         'delay': set_exposure_delay,
         'shutter': set_shutter,
+        'window': set_window,
         'status': status,
         'start': start,
         'stop': stop,

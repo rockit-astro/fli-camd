@@ -196,6 +196,8 @@ class CameraDaemon:
         # at end of the current frame
         self._stop_acquisition = False
 
+        self._log_acquisition_status = True
+
         # Condition to support cancellation of the pre-exposure delay
         self._exposure_delay_condition = threading.Condition()
 
@@ -541,7 +543,8 @@ class CameraDaemon:
                     self._stop_acquisition = True
         finally:
             print('exposure sequence: complete')
-            log.info(self._log_table, 'Exposure sequence complete')
+            if self._log_acquisition_status:
+                log.info(self._log_table, 'Exposure sequence complete')
             self._status = CameraStatus.Idle
 
     @Pyro4.expose
@@ -724,7 +727,7 @@ class CameraDaemon:
                     log.info(self._log_table, 'Initialized camera')
 
     @Pyro4.expose
-    def configure(self, params):
+    def configure(self, params, quiet=False):
         """Set camera configuration to the requested state
            params should be a dictionary with the following keys:
               temperature: Temperature set point
@@ -736,6 +739,8 @@ class CameraDaemon:
 
            The params dictionary should be validated using the
            schema returned by the configure_validation_schema helper
+
+            Set quiet=True to disable log messages
         """
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -755,14 +760,16 @@ class CameraDaemon:
             if not self.__set_target_temperature(temperature):
                 return CommandStatus.Failed
 
-            log.info(self._log_table, 'Target temperature set to ' + str(temperature))
+            if not quiet:
+                log.info(self._log_table, 'Target temperature set to ' + str(temperature))
 
             # Reset shutter
             shutter = params.get('shutter', False)
             if not self.__set_shutter(shutter):
                 return CommandStatus.Failed
 
-            log.info(self._log_table, 'Shutter set to ' + ('auto' if shutter else 'closed'))
+            if not quiet:
+                log.info(self._log_table, 'Shutter set to ' + ('auto' if shutter else 'closed'))
 
             # Reset window
             window = params.get('window', [
@@ -773,20 +780,24 @@ class CameraDaemon:
                                                                  window[2], window[3]):
                 return CommandStatus.Failed
 
-            region = '[{}:{},{}:{}]'.format(window[0], window[1], window[2], window[3])
-            log.info(self._log_table, 'Window set to ' + region)
+            if not quiet:
+                region = '[{}:{},{}:{}]'.format(window[0], window[1], window[2], window[3])
+                log.info(self._log_table, 'Window set to ' + region)
 
             # Reset exposure delay
             self._exposure_delay = params.get('delay', self._config['delay'])
 
-            log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(self._exposure_delay))
+            if not quiet:
+                log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(
+                    self._exposure_delay))
 
             # Reset exposure time
             exposure = params.get('exposure', self._config['exposure'])
             if not self.__set_exposure_time(exposure):
                 return CommandStatus.Failed
 
-            log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(exposure))
+            if not quiet:
+                log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(exposure))
 
             return CommandStatus.Succeeded
 
@@ -909,7 +920,7 @@ class CameraDaemon:
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def start_sequence(self, count):
+    def start_sequence(self, count, quiet=False):
         """Starts an exposure sequence with a set number of frames, or 0 to run until stopped"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -931,10 +942,13 @@ class CameraDaemon:
             elif count > 1:
                 count_msg = str(count) + ' frames'
 
-            log.info(self._log_table, 'Starting exposure sequence (' + count_msg + ')')
+            if not quiet:
+                log.info(self._log_table, 'Starting exposure sequence (' + count_msg + ')')
+
             self._sequence_frame_limit = count
             self._sequence_frame_count = 0
             self._stop_acquisition = False
+            self._log_acquisition_status = not quiet
             self._acquisition_thread = threading.Thread(target=self.__run_exposure_sequence)
             self._acquisition_thread.daemon = False
             self._acquisition_thread.start()

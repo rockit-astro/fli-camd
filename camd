@@ -344,7 +344,8 @@ class CameraDaemon:
 
                 while True:
                     timeleft = c_long()
-                    status = self._driver.FLIGetExposureStatus(self._handle, byref(timeleft))
+                    with self._driver_lock:
+                        status = self._driver.FLIGetExposureStatus(self._handle, byref(timeleft))
                     if status != 0 or timeleft.value == 0:
                         break
                     time.sleep(timeleft.value / 1000.)

@@ -9,13 +9,16 @@ _cam()
 
     case "${prev}" in
         rasa)
-            opts="status exposure shutter start init temperature kill reboot"
+            opts="status exposure shutter start window init temperature kill reboot"
             ;;
         shutter)
             opts="auto dark"
             ;;
         start)
             opts="continuous"
+            ;;
+        window)
+            opts="default"
             ;;
         *)
             ;;

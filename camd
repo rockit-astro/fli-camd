@@ -873,7 +873,7 @@ class CameraDaemon:
             return CommandStatus.Succeeded
 
     @Pyro4.expose
-    def set_window(self, x1, x2, y1, y2, quiet=False):
+    def set_window(self, window, quiet=False):
         """Sets the CCD readout window in unbinned (hardware) pixels"""
         if not pyro_client_matches(self._control_ips):
             return CommandStatus.InvalidControlIP
@@ -888,11 +888,20 @@ class CameraDaemon:
             if self._status != CameraStatus.Idle:
                 return CommandStatus.CameraNotIdle
 
-            if not self.__set_readout_window(x1, x2, y1, y2):
+            if window is None:
+                window = [
+                    1, self._visible_x2 - self._visible_x1,
+                    1, self._visible_y2 - self._visible_y1
+                ]
+
+            if len(window) != 4:
+                return CommandStatus.Failed
+
+            if not self.__set_readout_window(window[0], window[1], window[2], window[3]):
                 return CommandStatus.WindowOutsideCCD
 
             if not quiet:
-                region = '[{}:{},{}:{}]'.format(x1, x2, y1, y2)
+                region = '[{}:{},{}:{}]'.format(window[0], window[1], window[2], window[3])
                 log.info(self._log_table, 'Window set to ' + region)
             return CommandStatus.Succeeded
 

@@ -170,14 +170,20 @@ def set_shutter(daemon, args):
 
 def set_window(daemon, args):
     """Set the camera readout window"""
+    window = None
     if len(args) == 4:
-        x1 = int(args[0])
-        x2 = int(args[1])
-        y1 = int(args[2])
-        y2 = int(args[3])
+        window = [
+            int(args[0]),
+            int(args[1]),
+            int(args[2]),
+            int(args[3])
+        ]
+
+    if window or (len(args) == 1 and args[0] == 'default'):
         with daemon.connect() as camd:
-            return camd.set_window(x1, x2, y1, y2)
-    print('usage: {} [{}] window <x1> <x2> <y1> <y2>'.format(SCRIPT_NAME, CAMERAS))
+            return camd.set_window(window)
+
+    print('usage: {} [{}] window (<x1> <x2> <y1> <y2>|default)'.format(SCRIPT_NAME, CAMERAS))
     return -1
 
 def start(daemon, args):

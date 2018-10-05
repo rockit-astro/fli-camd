@@ -181,9 +181,8 @@ class GPSTimer:
         self.__send_configure_message(0x0D, 0x03, True) # TIM-TM2 (time mark data)
         self.__send_configure_message(0x01, 0x07, True) # NAV-PVT (Navigation Pos/Vel/Time)
 
-        # UBX-CFG-NAV5 (set dynamic model to stationary, force 3D fixes only, force USNO UTC time base)
-        self.__send_message(0x06, 0x24,
-        [
+        # UBX-CFG-NAV5 (set stationary dynamic model, force 3D fixes only, force USNO UTC time base)
+        self.__send_message(0x06, 0x24, [
             0xFF, 0xFF,# Parameters bitmask (default value)
             0x02, # Stationary dynamic model (changed from default = 0x00)
             0x03, # Allow 2D or 3D fixes (default value)
@@ -318,4 +317,3 @@ class GPSTimer:
         """Clears the last recorded trigger"""
         with self._lock:
             self._last_start = self._last_end = None
-

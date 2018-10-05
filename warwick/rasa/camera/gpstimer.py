@@ -71,10 +71,11 @@ class GPSLocalCheckStatus:
         return 'unknown status {}'.format(status_code)
 
 class GPSTimer:
-    def __init__(self, port_path, port_baud, log_table):
+    def __init__(self, port_path, port_baud, log_table, active_high=False):
         self._port_path = port_path
         self._port_baud = port_baud
         self._log_table = log_table
+        self._active_high = active_high
         self._port = None
         self._port_error = False
         self._lock = threading.Lock()
@@ -225,11 +226,18 @@ class GPSTimer:
 
             if valid and timeBaseUTC and utc:
                 with self._lock:
-                    if newFallingEdge:
-                        self._last_start = gps_to_utc(wnF, towMsF, towSubMsF)
-                        self._last_end = None
-                    if newRisingEdge:
-                        self._last_end = gps_to_utc(wnR, towMsR, towSubMsR)
+                    if self._active_high:
+                        if newRisingEdge:
+                            self._last_start = gps_to_utc(wnR, towMsR, towSubMsR)
+                            self._last_end = None
+                        if newFallingEdge:
+                            self._last_end = gps_to_utc(wnF, towMsF, towSubMsF)
+                    else:
+                        if newFallingEdge:
+                            self._last_start = gps_to_utc(wnF, towMsF, towSubMsF)
+                            self._last_end = None
+                        if newRisingEdge:
+                            self._last_end = gps_to_utc(wnR, towMsR, towSubMsR)
         elif msg_cls == 0x01 and msg_id == 0x07: # NAV-PVT
             (year, month, day, hour, minute, second, valid, _, nanosecond, fixType,
              _, _, numSV) = struct.unpack_from('HBBBBBBIiBBBB', buf, offset=10)

@@ -12,7 +12,7 @@
 # license that conforms to the Open Source Definition (Version 1.9)
 # published by the Open Source Initiative.
 
-Name:           python34-warwick-rasa-camera
+Name:           python36-warwick-rasa-camera
 Version:        1.0.4
 Release:        0
 License:        GPL3
@@ -23,20 +23,20 @@ BuildArch:      noarch
 %description
 Part of the observatory software for the RASA prototype telescope.
 
-python34-warwick-rasa-camera holds the common camera code.
+python36-warwick-rasa-camera holds the common camera code.
 
 %prep
 
 rsync -av --exclude=build .. .
 
 %build
-python3 setup.py build
+%{__python3_other} setup.py build
 
 %install
-python3 setup.py install --prefix=%{_prefix} --root=%{buildroot}
+%{__python3_other} setup.py install --prefix=%{_prefix} --root=%{buildroot}
 
 %files
 %defattr(-,root,root,-)
-%{python3_sitelib}/*
+%{python3_other_sitelib}/*
 
 %changelog

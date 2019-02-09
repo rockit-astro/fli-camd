@@ -1,15 +1,13 @@
 Name:      rasa-camera-server
-Version:   2.1.17
+Version:   2.2.0
 Release:   0
 Url:       https://github.com/warwick-one-metre/rasa-camd
 Summary:   Camera control server for the RASA prototype telescope.
 License:   GPL-3.0
 Group:     Unspecified
 BuildArch: noarch
-
-%if 0%{?centos_ver}
-Requires:  python34, python34-Pyro4, python34-numpy, python34-astropy, python34-warwick-observatory-common, python34-warwick-rasa-camera, rasa-libfli, observatory-log-client, %{?systemd_requires}
-%endif
+Requires:  python36, python36-Pyro4, python36-numpy, python36-astropy, python36-warwick-observatory-common, python36-warwick-rasa-camera
+Requires:  rasa-libfli, observatory-log-client, %{?systemd_requires}
 
 %description
 Part of the observatory software for the RASA prototype telescope.

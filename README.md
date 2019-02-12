@@ -10,7 +10,11 @@ See [Software Infrastructure](https://github.com/warwick-one-metre/docs/wiki/Sof
 
 ### Software Setup
 
-TODO: Explain fliusb and libfli installation.
+Build and install `fliusb` kernel driver:
+* Clone the fliusb driver repository from https://github.com/LCOGT/fliusb.git 
+* Compile using `make`
+* Copy `fliusb.ko` to `/usr/lib/modules/$(uname -r)/extra/`
+* Create file `/etc/modules-load.d/fliusb.conf` with contents `fliusb` 
 
 After installing `rasa-camera-server`, the `rasa_camd` service must be enabled using:
 ```

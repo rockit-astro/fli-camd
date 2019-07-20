@@ -410,7 +410,7 @@ class CameraDaemon:
                         gps_tsst = 'MISSING'
 
                     # Trigger signals are only generated when the shutter is enabled
-                    use_trigger = trigger[0] != None and trigger[1] != None \
+                    use_trigger = not (trigger[0] is None) and not (trigger[1] is None) \
                         and self._shutter_enabled
 
                     if use_trigger:

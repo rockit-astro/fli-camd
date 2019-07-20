@@ -17,17 +17,11 @@
 
 """Daemon for controlling the RASA prototype cameras via Pyro"""
 
-# pylint: disable=invalid-name
-# pylint: disable=no-self-use
-# pylint: disable=broad-except
-# pylint: disable=too-few-public-methods
 # pylint: disable=too-many-return-statements
 # pylint: disable=too-many-instance-attributes
 # pylint: disable=too-many-lines
 # pylint: disable=too-many-branches
 # pylint: disable=too-many-statements
-# pylint: disable=too-many-locals
-# pylint: disable=too-many-arguments
 
 import argparse
 from ctypes import (c_double, c_long, c_size_t, c_uint16, c_char_p, byref, create_string_buffer,

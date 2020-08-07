@@ -13,7 +13,7 @@ all:
 	awk '{sub("SOFTWARE_VERSION = .*$$","SOFTWARE_VERSION = \"$(SERVER_VERSION) ($(GIT_VERSION))\""); print $0}' camd.bak > camd
 	${RPMBUILD} -ba rasa-camera-server.spec
 	${RPMBUILD} -ba rasa-camera-client.spec
-	${RPMBUILD} -ba python36-warwick-rasa-camera.spec
+	${RPMBUILD} -ba python3-warwick-rasa-camera.spec
 	mv build/noarch/*.rpm .
 	rm -rf build
 	mv camd.bak camd

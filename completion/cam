@@ -1,28 +1,30 @@
 _cam()
 {
     compopt +o default
-    local cur prev opts
+    local cur prev prevprev opts
     COMPREPLY=()
     cur="${COMP_WORDS[COMP_CWORD]}"
     prev="${COMP_WORDS[COMP_CWORD-1]}"
-    opts="rasa"
+    prevprev="${COMP_WORDS[COMP_CWORD-2]}"
 
-    case "${prev}" in
-        rasa)
-            opts="status exposure shutter start window init temperature kill reboot"
-            ;;
-        shutter)
-            opts="auto dark"
-            ;;
-        start)
-            opts="continuous"
-            ;;
-        window)
-            opts="default"
-            ;;
-        *)
-            ;;
-    esac
+    if [[ "${prevprev}" == "cam" ]]; then
+        opts="status exposure shutter start window init temperature kill"
+    else
+        opts=$(cam list-cameras)
+        case "${prev}" in
+            shutter)
+                opts="auto dark"
+                ;;
+            start)
+                opts="continuous"
+                ;;
+            window)
+                opts="default"
+                ;;
+            *)
+                ;;
+        esac
+    fi
 
     COMPREPLY=($(compgen -W "${opts}" -- ${cur}))
     return 0

@@ -1,18 +1,18 @@
 #
-# This file is part of rasa-camd
+# This file is part of fli-camd
 #
-# rasa-camd is free software: you can redistribute it and/or modify
+# fli-camd is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# rasa-camd is distributed in the hope that it will be useful,
+# fli-camd is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with rasa-camd.  If not, see <http://www.gnu.org/licenses/>.
+# along with fli-camd.  If not, see <http://www.gnu.org/licenses/>.
 
 """Controller for GPS timer board"""
 
@@ -22,6 +22,7 @@ import threading
 import time
 import serial
 from warwick.observatory.common import log
+from .constants import GPSFixType, GPSLocalCheckStatus
 
 # pylint: disable=invalid-name
 # pylint: disable=broad-except
@@ -31,11 +32,6 @@ from warwick.observatory.common import log
 # pylint: disable=missing-docstring
 # pylint: disable=too-few-public-methods
 
-FMT_GREEN = u'\033[92m'
-FMT_RED = u'\033[91m'
-FMT_YELLOW = u'\033[93m'
-FMT_BOLD = u'\033[1m'
-FMT_CLEAR = u'\033[0m'
 
 def gps_to_utc(week, ms, ns):
     """Convert a GPS week number and millisecond count
@@ -44,30 +40,6 @@ def gps_to_utc(week, ms, ns):
     return datetime.datetime(1980, 1, 6) + datetime.timedelta(days=7 * week, milliseconds=ms,
                                                               microseconds=ns/1000)
 
-class GPSFixType:
-    NoFix, DeadReckoning, Pos2D, Pos3D, GPSPlusDeadReckoning, TimeOnly = range(6)
-    Labels = ['NO FIX', 'DEAD RECKONING', '2D FIX', '3D FIX', 'GPS + DEAD RECKONING',
-              'TIME ONLY FIX']
-
-class GPSLocalCheckStatus:
-    Unknown, Good, Warn, Error = range(4)
-    _labels = [
-        ('UNKNOWN', ''),
-        ('GOOD', FMT_GREEN),
-        ('WARNING', FMT_YELLOW),
-        ('BAD', FMT_RED)
-    ]
-
-    @classmethod
-    def label(cls, status_code, colored=False):
-        """Returns a human readable string describing an error code"""
-        if status_code >= 0 and status_code < len(cls._labels):
-            status = cls._labels[status_code]
-            if colored:
-                return FMT_BOLD + status[1] + status[0] + FMT_CLEAR
-            return status[0]
-
-        return 'unknown status {}'.format(status_code)
 
 class GPSTimer:
     def __init__(self, port_path, port_baud, log_table, active_high=False):
@@ -182,24 +154,24 @@ class GPSTimer:
 
         # UBX-CFG-NAV5 (set stationary dynamic model, force 3D fixes only, force USNO UTC time base)
         self.__send_message(0x06, 0x24, [
-            0xFF, 0xFF,# Parameters bitmask (default value)
-            0x02, # Stationary dynamic model (changed from default = 0x00)
-            0x03, # Allow 2D or 3D fixes (default value)
+            0xFF, 0xFF,  # Parameters bitmask (default value)
+            0x02,        # Stationary dynamic model (changed from default = 0x00)
+            0x03,        # Allow 2D or 3D fixes (default value)
             0x09, 0x53, 0x00, 0x00, # Fixed altitude for 2D fix mode (changed from default = 0)
             0x10, 0x27, 0x00, 0x00, # Fixed altitude variance for 2D fix mode (default value)
-            0x05, # Minimum elevation for satellite to be used (default value)
-            0x00, # Reserved (default value)
-            0xFA, 0x00, # Position DOP mask (default value)
-            0xFA, 0x00, # Time DOP mask (default value)
-            0x64, 0x00, # Position accuracy mask (default value)
-            0x5E, 0x01, # Time accuracy mask (default value)
-            0x00, # Static hold threshold (default value)
-            0x3C, # DGNSS timeout (default value)
-            0x00, # Number of satellites required before attempting fix (default value)
-            0x00, # Signal threshold for satellites to attempt fix (default value)
-            0x00, 0x00, # Reserved, (default value)
-            0x00, 0x00, # Static hold distance threshold, (default value)
-            0x03, # USNO UTC time standard (changed from default = 0x00)
+            0x05,        # Minimum elevation for satellite to be used (default value)
+            0x00,        # Reserved (default value)
+            0xFA, 0x00,  # Position DOP mask (default value)
+            0xFA, 0x00,  # Time DOP mask (default value)
+            0x64, 0x00,  # Position accuracy mask (default value)
+            0x5E, 0x01,  # Time accuracy mask (default value)
+            0x00,        # Static hold threshold (default value)
+            0x3C,        # DGNSS timeout (default value)
+            0x00,        # Number of satellites required before attempting fix (default value)
+            0x00,        # Signal threshold for satellites to attempt fix (default value)
+            0x00, 0x00,  # Reserved, (default value)
+            0x00, 0x00,  # Static hold distance threshold, (default value)
+            0x03,        # USNO UTC time standard (changed from default = 0x00)
             0x00, 0x00, 0x00, 0x00, 0x00 # Reserved
         ])
 
@@ -216,25 +188,25 @@ class GPSTimer:
         if msg_cls == 0x0D and msg_id == 0x03: # TIM-TM2
             (_, flags, _, wnR, wnF, towMsR, towSubMsR, towMsF, towSubMsF, _) = \
                 struct.unpack_from('BBHHHIIIII', buf, offset=6)
-            newFallingEdge = flags & 0x04 == 0x04
-            timeBaseUTC = flags & 0x10 == 0x10
+            new_falling_edge = flags & 0x04 == 0x04
+            time_base_utc = flags & 0x10 == 0x10
             utc = flags & 0x20 == 0x20
             valid = flags & 0x40 == 0x40
-            newRisingEdge = flags & 0x80 == 0x80
+            new_rising_edge = flags & 0x80 == 0x80
 
-            if valid and timeBaseUTC and utc:
+            if valid and time_base_utc and utc:
                 with self._lock:
                     if self._active_high:
-                        if newRisingEdge:
+                        if new_rising_edge:
                             self._last_start = gps_to_utc(wnR, towMsR, towSubMsR)
                             self._last_end = None
-                        if newFallingEdge:
+                        if new_falling_edge:
                             self._last_end = gps_to_utc(wnF, towMsF, towSubMsF)
                     else:
-                        if newFallingEdge:
+                        if new_falling_edge:
                             self._last_start = gps_to_utc(wnF, towMsF, towSubMsF)
                             self._last_end = None
-                        if newRisingEdge:
+                        if new_rising_edge:
                             self._last_end = gps_to_utc(wnR, towMsR, towSubMsR)
         elif msg_cls == 0x01 and msg_id == 0x07: # NAV-PVT
             (year, month, day, hour, minute, second, valid, _, nanosecond, fixType,
@@ -276,9 +248,7 @@ class GPSTimer:
     def __send_message(self, msg_cls, msg_id, payload):
         if len(payload) > 255:
             raise Exception("payload > 255 bytes not implemented")
-        buf = [0xB5, 0x62]
-        buf.append(msg_cls)
-        buf.append(msg_id)
+        buf = [0xB5, 0x62, msg_cls, msg_id]
         cka = msg_cls + msg_id
         ckb = 2 * msg_cls + msg_id
         buf.append(len(payload))
@@ -310,7 +280,7 @@ class GPSTimer:
     def last_trigger(self):
         """Returns a tuple containing the last trigger times"""
         with self._lock:
-            return (self._last_start, self._last_end)
+            return self._last_start, self._last_end
 
     def clear_last_trigger(self):
         """Clears the last recorded trigger"""

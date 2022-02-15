@@ -1,21 +1,21 @@
 #!/usr/bin/env python3.6
 #
-# This file is part of rasa-camd.
+# This file is part of fli-camd.
 #
-# rasa-camd is free software: you can redistribute it and/or modify
+# fli-camd is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 #
-# rasa-camd is distributed in the hope that it will be useful,
+# fli-camd is distributed in the hope that it will be useful,
 # but WITHOUT ANY WARRANTY; without even the implied warranty of
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details.
 #
 # You should have received a copy of the GNU General Public License
-# along with rasa-camd.  If not, see <http://www.gnu.org/licenses/>.
+# along with fli-camd.  If not, see <http://www.gnu.org/licenses/>.
 
-"""Daemon for controlling the RASA prototype cameras via Pyro"""
+"""Daemon for controlling an FLI ML50100 camera via Pyro"""
 
 # pylint: disable=too-many-return-statements
 # pylint: disable=too-many-instance-attributes
@@ -24,58 +24,152 @@
 # pylint: disable=too-many-statements
 
 import argparse
-from ctypes import (c_double, c_long, c_size_t, c_uint16, c_char_p, byref, create_string_buffer,
-                    sizeof, POINTER, CDLL)
+from ctypes import (c_bool, c_double, c_long, c_size_t, c_uint16, c_char_p,
+                    byref, create_string_buffer, sizeof, POINTER, CDLL)
 import datetime
 import json
+from multiprocessing import Process, Queue, Value
+import os.path
 import pathlib
 import shutil
 import threading
 import time
 from astropy.io import fits
-import numpy
+import numpy as np
 import Pyro4
-from warwick.observatory.common import (
-    daemons,
-    log,
-    IP,
-    TryLock)
+from warwick.observatory.common import daemons, log, TryLock
 from warwick.observatory.common.helpers import pyro_client_matches
-from warwick.rasa.camera import (
-    CommandStatus,
-    CameraStatus,
-    GPSTimer,
-    GPSFixType,
-    GPSLocalCheckStatus)
+from warwick.observatory.camera.fli import (Config, CommandStatus, CameraStatus,
+                                            GPSTimer, GPSFixType, GPSLocalCheckStatus)
 
 # Set automatically when generating RPM package
-SOFTWARE_VERSION = "UNKNOWN"
+SOFTWARE_VERSION = "20220215 (git-7cc9bd4)"
 
-CONFIG = {
-    'rasa': {
-        'daemon': daemons.rasa_camera,
-        'serial': 'ML6314917',
-        'timerport': '/dev/gpstimer',
-        'timerbaud': 9600,
-        'temperature': -20,
-        'exposure': 1,
-        'delay': 0,
-        'logtable': 'rasa_camd',
-        'arm': 'RASA',
-        'outputpath': '/var/tmp/',
-        'outputprefix': 'rasa',
-        'expcountlog': '/var/tmp/rasa-counter.json',
-        'controlips': [IP.RASAMain]
-    },
-}
 
-# If frames are being generated faster than the pipeline can handle
-# then we block the next frame until it is ready.
-# If it blocks for longer than this interval (in seconds) give up and cancel the sequence
-PIPELINE_HANDOVER_TIMEOUT = 10
+def process_frames(process_queue, stop_signal, camera_id,
+                   output_path, log_name, pipeline_daemon_name, pipeline_handover_timeout):
+    """
+    Helper process to save frames to disk.
+    This uses a process (rather than a thread) to avoid the GIL stalling frame acquisition
+    """
+    pipeline_daemon = getattr(daemons, pipeline_daemon_name)
+    while True:
+        frame = process_queue.get()
 
-# Delay between camera state queries (in seconds)
-STATUS_QUERY_DELAY = 1
+        start_time = frame['start_time'].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+        end_time = frame['end_time'].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+        read_end_time = frame['read_end_time'].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+
+        if frame['gps_enabled']:
+
+            if frame['gps_time_valid']:
+                gps_timestamp_status = 'VALID'
+            elif frame['shutter_enabled']:
+                gps_timestamp_status = 'MISSING'
+            else:
+                gps_timestamp_status = 'INVALID'
+
+            gps_header = [
+                (None, None, None),
+                ('COMMENT', ' ---             GPS INFORMATION             --- ', ''),
+                ('GPS-FIX', GPSFixType.label(frame['gps_fix_type']), 'GPS receiver fix status'),
+                ('GPS-SATS', frame['gps_satellites'], 'GPS receiver satellite count'),
+                ('GPS-TMST', gps_timestamp_status, 'GPS timestamp status'),
+                ('TIME-CHK', round(frame['gps_last_check_delta'], 1), '[s] approximate offset of PC clock from GPS'),
+            ]
+
+            if frame['gps_start_time'] is not None:
+                gps_start_time = frame['gps_start_time'].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+                gps_header.append(('GPS-BEG', gps_start_time, '[UTC] GPS timestamp when exposure started'))
+            else:
+                gps_header.append(('COMMENT', ' GPS-BEG not available', ''))
+
+            if frame['gps_end_time'] is not None:
+                gps_end_time = frame['gps_end_time'].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
+                gps_header.append(('GPS-END', gps_end_time, '[UTC] GPS timestamp when exposure ended'))
+            else:
+                gps_header.append(('COMMENT', ' GPS-END not available', ''))
+        else:
+            gps_header = []
+
+        if frame['gps_enabled'] and frame['gps_time_valid'] and gps_start_time and gps_end_time:
+            date_header = [
+                ('DATE-OBS', gps_start_time, '[utc] exposure start time from TIME-SRC'),
+                ('DATE-END', gps_end_time, '[utc] exposure end time from TIME-SRC'),
+                ('TIME-SRC', 'GPS', 'DATE-OBS is a hardware-triggered GPS timestamp'),
+            ]
+        else:
+            date_header = [
+                ('DATE-OBS', start_time, '[utc] exposure start time from TIME-SRC'),
+                ('DATE-END', end_time, '[utc] exposure end time from TIME-SRC'),
+                ('TIME-SRC', 'NTP', 'DATE-OBS is estimated from NTP-synced PC clock'),
+            ]
+
+        shutter_mode = 'AUTO' if frame['shutter_enabled'] else 'CLOSED'
+        header = [
+            (None, None, None),
+            ('COMMENT', ' ---                DATE/TIME                --- ', ''),
+        ] + date_header + [
+            ('EXPTIME', round(frame['exposure'], 3), '[s] exposure length'),
+            ('PC-BEG', start_time, '[UTC] local PC time of software trigger'),
+            ('PC-RDBEG', end_time, '[UTC] local PC time when readout started'),
+            ('PC-RDEND', read_end_time, '[UTC] local PC time when readout completed'),
+            (None, None, None),
+            ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
+            ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
+            ('CAMERA', '{} ({})'.format(frame['camera_model'], frame['camera_serial']),
+             'camera model and serial number'),
+            ('CAMID', camera_id, 'camera identifier'),
+            ('CAM-TEMP', round(frame['temperature'], 2), '[deg c] CCD temperature at end of exposure'),
+            ('SET-TEMP', round(frame['target_temperature'], 2), '[deg c] CCD temperature set point'),
+            ('TEMP-LCK', frame['temperature_locked'], 'CCD temperature is locked to set point'),
+            ('CAM-XBIN', 1, '[px] x binning'),
+            ('CAM-YBIN', 1, '[px] y binning'),
+            ('CAM-WIND', '[{}:{},{}:{}]'.format(
+                frame['win_x'], frame['win_x'] + frame['win_width'] - 1,
+                frame['win_y'], frame['win_y'] + frame['win_height'] - 1),
+             '[x1:x2,y1:y2] ccd window (detector coords)'),
+            ('SHUTTER', shutter_mode, 'shutter mode'),
+            ('IMAG-RGN', '[{}:{},{}:{}]'.format(
+                frame['image_x1'], frame['image_x2'],
+                frame['image_y1'], frame['image_y2']),
+             '[x1:x2,y1:y2] image region (image coords)'),
+            ('EXPCNT', frame['exposure_count'], 'running exposure count since EXPCREF'),
+            ('EXPCREF', frame['exposure_count_reference'], 'date the exposure counter was reset'),
+            ('SHTRCNT', frame['shutter_count'], 'running shutter count since SHTRCREF'),
+            ('SHTRCREF', frame['shutter_count_reference'],
+             'date the shutter counter was reset')
+        ] + gps_header
+
+        hdu = fits.PrimaryHDU(frame['data'])
+
+        # Using Card and append() to force comment cards to be placed inline
+        for h in header:
+            hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
+
+        # Save errors shouldn't interfere with preview updates, so we use a separate try/catch
+        try:
+            filename = '{}-{:08d}.fits'.format(camera_id, frame['exposure_count'])
+            path = os.path.join(output_path, filename)
+
+            # Simulate an atomic write by writing to a temporary file then renaming
+            hdu.writeto(path + '.tmp', overwrite=True)
+            shutil.move(path + '.tmp', path)
+            print('Saving temporary frame: ' + filename)
+
+        except Exception as e:
+            stop_signal.value = True
+            log.error(log_name, 'Failed to save temporary frame (' + str(e) + ')')
+
+        # Hand frame over to the pipeline
+        # This may block if the pipeline is busy
+        try:
+            with pipeline_daemon.connect(pipeline_handover_timeout) as pipeline:
+                pipeline.notify_frame(camera_id, filename)
+        except Exception as e:
+            stop_signal.value = True
+            log.error(log_name, 'Failed to hand frame to pipeline (' + str(e) + ')')
+
 
 def open_device(driver, serial):
     """Returns c_long(-1) if device is not found"""
@@ -100,18 +194,15 @@ def open_device(driver, serial):
             driver.FLIFreeList(devices)
     return c_long(-1), None
 
+
 class CameraDaemon:
     """Daemon interface for andor camera"""
     def __init__(self, config):
         self._config = config
         self._status = CameraStatus.Disabled
-        self._log_table = config['logtable']
-        self._arm_name = config['arm']
-        self._control_ips = config['controlips']
 
-        if config['timerport']:
-            self._timer = GPSTimer(config['timerport'], config['timerbaud'],
-                                   config['logtable'])
+        if config.gps_port:
+            self._timer = GPSTimer(config.gps_port, config.gps_baud, config.log_name)
         else:
             self._timer = None
 
@@ -122,12 +213,11 @@ class CameraDaemon:
         self._status_condition = threading.Condition()
         self._command_lock = threading.Lock()
 
-        self._camera_serial = config['serial']
         self._camera_model = 'unknown'
 
         self._temperature = 0
         self._temperature_locked = False
-        self._target_temperature = config['temperature']
+        self._target_temperature = config.temperature_setpoint
 
         # Temperature limits: loaded during init
         self._min_temperature = 0
@@ -146,8 +236,8 @@ class CameraDaemon:
         # Shutter enabled (opens during exposures), or remains closed
         self._shutter_enabled = False
 
-        self._exposure_time = config['exposure']
-        self._exposure_delay = config['delay']
+        self._exposure_time = 1
+        self._exposure_delay = 0
 
         # Limit and number of frames acquired during the next sequence
         # Set to 0 to run continuously
@@ -163,11 +253,11 @@ class CameraDaemon:
         self._sequence_exposure_start_time = datetime.datetime.utcnow()
 
         # Information for building the output filename
-        self._output_directory = pathlib.Path(config['outputpath'])
-        self._output_frame_prefix = config['outputprefix']
+        self._output_directory = pathlib.Path(config.output_path)
+        self._output_frame_prefix = config.output_prefix
 
         # Persistent frame counters
-        self._counter_filename = config['expcountlog']
+        self._counter_filename = config.expcount_path
         try:
             with open(self._counter_filename, 'r') as infile:
                 data = json.load(infile)
@@ -200,6 +290,16 @@ class CameraDaemon:
         status_thread.daemon = True
         status_thread.start()
 
+        # Subprocess for processing acquired frames
+        self._processing_queue = Queue()
+        self._processing_stop_signal = Value(c_bool, False)
+
+        processing_process = Process(target=process_frames, args=(
+            self._processing_queue, self._processing_stop_signal, config.camera_id, config.output_path,
+            config.log_name, config.pipeline_daemon_name, config.pipeline_handover_timeout))
+        processing_process.daemon = True
+        processing_process.start()
+
     def __poll_camera_status(self):
         """Background thread that polls the camera status"""
         while True:
@@ -215,7 +315,7 @@ class CameraDaemon:
                 else:
                     self._status = CameraStatus.Disabled
 
-            time.sleep(STATUS_QUERY_DELAY)
+            time.sleep(self._config.temperature_update_delay)
 
     def __set_target_temperature(self, target_temperature):
         """Set the camera temperature
@@ -270,13 +370,13 @@ class CameraDaemon:
            (for compatibility with e.g. cfitsio image slices)
            Returns True on success
         """
-        xmax = self._visible_x2 - self._visible_x1
-        ymax = self._visible_y2 - self._visible_y1
+        x_max = self._visible_x2 - self._visible_x1
+        y_max = self._visible_y2 - self._visible_y1
 
         if x1 >= x2 or y1 >= y2:
             return False
 
-        if x1 < 1 or y1 < 1 or x2 > xmax or y2 > ymax:
+        if x1 < 1 or y1 < 1 or x2 > x_max or y2 > y_max:
             return False
 
         with self._driver_lock:
@@ -301,10 +401,11 @@ class CameraDaemon:
            Tagged frames are pushed to the acquisition queue
            for further processing on another thread"""
         try:
+            self._processing_stop_signal.value = False
             readout_width = self._window_x2 - self._window_x1 + 1
             readout_height = self._window_y2 - self._window_y1 + 1
             pixel_count = readout_width * readout_height
-            while not self._stop_acquisition:
+            while not self._stop_acquisition and not self._processing_stop_signal.value:
                 if self._timer:
                     self._timer.clear_last_trigger()
 
@@ -317,17 +418,14 @@ class CameraDaemon:
                         self._exposure_delay_condition.wait(self._exposure_delay)
 
                     self._sequence_exposure_delay_start_time = None
-                    if self._stop_acquisition:
+                    if self._stop_acquisition or self._processing_stop_signal.value:
                         break
 
                 with self._driver_lock:
                     start_time = datetime.datetime.utcnow()
                     status = self._driver.FLIExposeFrame(self._handle)
                 if status != 0:
-                    print('exposure sequence: failed to start acquisition with status ' + \
-                          str(status))
-                    log.error(self._log_table, 'Failed to start exposure sequence (' \
-                        + str(status) + ')')
+                    log.error(self._config.log_name, 'Failed to start exposure sequence (' + str(status) + ')')
                     break
 
                 self._sequence_exposure_start_time = start_time
@@ -339,7 +437,7 @@ class CameraDaemon:
                 while True:
                     timeleft = c_long()
                     with self._driver_lock:
-                        if self._stop_acquisition:
+                        if self._stop_acquisition or self._processing_stop_signal.value:
                             self._driver.FLICancelExposure(self._handle)
                             break
 
@@ -351,13 +449,11 @@ class CameraDaemon:
                     with self._exposure_delay_condition:
                         self._exposure_delay_condition.wait(timeleft.value / 1000.)
 
-                if self._stop_acquisition:
+                if self._stop_acquisition or self._processing_stop_signal.value:
                     break
 
                 if status != 0:
-                    print('exposure sequence: waiting failed with status ' + str(status))
-                    log.error(self._log_table, 'Failed to wait for acquisition (' \
-                        + str(status) + ')')
+                    log.error(self._config.log_name, 'Failed to wait for acquisition (' + str(status) + ')')
                     break
 
                 end_time = datetime.datetime.utcnow()
@@ -371,16 +467,87 @@ class CameraDaemon:
 
                 read_end_time = datetime.datetime.utcnow()
 
-                if self._stop_acquisition:
+                if self._stop_acquisition or self._processing_stop_signal.value:
                     break
 
                 if status != 0:
-                    if not self._stop_acquisition:
-                        print('exposure sequence: failed to get acquired data with status ' + \
-                            str(status))
-                        log.error(self._log_table, 'Failed to query frame data (' \
-                            + str(status) + ')')
+                    if not self._stop_acquisition and not self._processing_stop_signal.value:
+                        log.error(self._config.log_name, 'Failed to query frame data (' + str(status) + ')')
                     break
+
+                gps_fix_type = GPSFixType.NoFix
+                gps_satellites = 0
+                gps_start_time = None
+                gps_end_time = None
+                gps_last_check_delta = 0
+                gps_time_valid = False
+
+                if self._timer:
+                    gps_start_time, gps_end_time = self._timer.last_trigger()
+                    status = self._timer.report_status()
+                    if status['last_check_status'] != GPSLocalCheckStatus.Unknown:
+                        gps_last_check_delta = round(status['last_check_delta'], 1)
+                    gps_fix_type = status['fix_type']
+                    gps_satellites = status['satellites']
+
+                    # Trigger signals are only generated when the shutter is enabled
+                    gps_time_valid = gps_start_time is not None and gps_end_time is not None \
+                        and self._shutter_enabled
+
+                    if gps_time_valid:
+                        # Sanity check the trigger times
+                        #   - exposure lengths must agree to within 1ms
+                        #   - exposure start times (corrected for clock drift)
+                        #     must agree to within 250ms
+                        trigger_length = (gps_end_time - gps_start_time).total_seconds()
+                        exposure_delta = trigger_length - float(self._exposure_time)
+                        start_delta = (gps_start_time - start_time).total_seconds() + status['last_check_delta']
+
+                        if abs(exposure_delta) > 0.001 or abs(start_delta) > 0.25:
+                            gps_time_valid = False
+                            print('Trigger for exposure {} failed validation:'.format(self._exposure_count))
+                            print('   GPS Start:', gps_start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                            print('   GPS End:', gps_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                            print('   PC Start:', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'))
+                            print('   Check Delta:', status['last_check_delta'])
+                            print('   Exposure delta: {:.6f}'.format(exposure_delta))
+                            print('   Start delta: {:.3f}'.format(start_delta))
+
+                readout_width = self._window_x2 - self._window_x1 + 1
+                readout_height = self._window_y2 - self._window_y1 + 1
+
+                self._processing_queue.put({
+                    'data': np.frombuffer(framedata, dtype=np.uint16).reshape((readout_height, readout_width)),
+                    'start_time': start_time,
+                    'end_time': end_time,
+                    'read_end_time': read_end_time,
+                    'gps_enabled': self._timer is not None,
+                    'gps_fix_type': gps_fix_type,
+                    'gps_satellites': gps_satellites,
+                    'gps_last_check_delta': gps_last_check_delta,
+                    'gps_time_valid': gps_time_valid,
+                    'gps_start_time': gps_start_time,
+                    'gps_end_time': gps_end_time,
+                    'exposure': self._exposure_time,
+                    'temperature': self._temperature,
+                    'target_temperature': self._target_temperature,
+                    'temperature_locked': self._temperature_locked,
+                    'win_x': 1,
+                    'win_width': readout_width,
+                    'win_y': 1,
+                    'win_height': readout_height,
+                    'image_x1': 1,
+                    'image_x2': readout_width,
+                    'image_y1': 1,
+                    'image_y2': readout_height,
+                    'shutter_enabled': self._shutter_enabled,
+                    'camera_model': self._camera_model,
+                    'camera_serial': self._config.camera_serial,
+                    'exposure_count': self._exposure_count,
+                    'exposure_count_reference': self._exposure_count_reference,
+                    'shutter_count': self._shutter_count,
+                    'shutter_count_reference': self._shutter_count_reference
+                })
 
                 self._exposure_count += 1
                 if self._shutter_enabled:
@@ -395,165 +562,20 @@ class CameraDaemon:
                         'shutter_reference': self._shutter_count_reference
                     }, outfile)
 
-                # Build metadata list
-                shutter = 'AUTO' if self._shutter_enabled else  'CLOSED'
-
-                obs_time = start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
-                time_src = 'NTP'
-                time_src_comment = 'DATE-OBS is a NTP-synced PC clock timestamp'
-                time_chk = gps_fix = gps_sats = gps_beg = gps_end = None
-                gps_tsst = 'DISABLED'
-                gps_sats = 0
-                gps_fix = GPSFixType.Labels[GPSFixType.NoFix]
-                if self._timer:
-                    trigger = self._timer.last_trigger()
-                    status = self._timer.report_status()
-                    if status['last_check_status'] != GPSLocalCheckStatus.Unknown:
-                        time_chk = round(status['last_check_delta'], 1)
-                    gps_fix = GPSFixType.Labels[status['fix_type']]
-                    gps_sats = status['satellites']
-
-                    if self._shutter_enabled:
-                        gps_tsst = 'MISSING'
-
-                    # Trigger signals are only generated when the shutter is enabled
-                    use_trigger = not (trigger[0] is None) and not (trigger[1] is None) \
-                        and self._shutter_enabled
-
-                    if use_trigger:
-                        # Sanity check the trigger times
-                        #   - exposure lengths must agree to within 1ms
-                        #   - exposure start times (corrected for clock drift)
-                        #     must agree to within 250ms
-                        trigger_length = (trigger[1] - trigger[0]).total_seconds()
-                        exposure_delta = trigger_length - float(self._exposure_time)
-                        start_delta = (trigger[0] - start_time).total_seconds() + \
-                            status['last_check_delta']
-
-                        if abs(exposure_delta) > 0.001 or abs(start_delta) > 0.25:
-                            use_trigger = False
-                            gps_tsst = 'INVALID'
-                            print('Trigger for exposure {} failed validation:'.format(
-                                self._exposure_count))
-                            print('   GPS Start:', trigger[0].strftime('%Y-%m-%dT%H:%M:%S.%f'))
-                            print('   GPS End:', trigger[1].strftime('%Y-%m-%dT%H:%M:%S.%f'))
-                            print('   PC Start:', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f'))
-                            print('   Check Delta:', status['last_check_delta'])
-                            print('   Exposure delta: {:.6f}'.format(exposure_delta))
-                            print('   Start delta: {:.3f}'.format(start_delta))
-
-                    if use_trigger:
-                        time_src = 'GPS'
-                        time_src_comment = 'DATE-OBS is a hardware-triggered GPS timestamp'
-                        gps_beg = trigger[0].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
-                        gps_end = trigger[1].strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]
-                        obs_time = gps_beg
-                        gps_tsst = 'VALID'
-
-                readout_width = self._window_x2 - self._window_x1 + 1
-                readout_height = self._window_y2 - self._window_y1 + 1
-                header = [
-                    (None, None, None),
-                    ('COMMENT', ' ---                DATE/TIME                --- ', ''),
-                    ('DATE-OBS', obs_time, '[UTC] exposure start time from TIME-SRC'),
-                    ('TIME-SRC', time_src, time_src_comment),
-                    ('EXPTIME', round(self._exposure_time, 3), '[s] exposure length'),
-                    ('GPS-FIX', gps_fix, 'GPS receiver fix status'),
-                    ('GPS-SATS', gps_sats, 'GPS receiver satellite count'),
-                    ('GPS-TMST', gps_tsst, 'GPS timestamp status'),
-                    ('GPS-BEG', gps_beg, '[UTC] GPS timestamp when exposure started'),
-                    ('GPS-END', gps_end, '[UTC] GPS timestamp when exposure ended'),
-                    ('PC-BEG', start_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
-                     '[UTC] local PC time of software trigger'),
-                    ('PC-RDBEG', end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
-                     '[UTC] local PC time when readout started'),
-                    ('PC-RDEND', read_end_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3],
-                     '[UTC] local PC time when readout completed'),
-                    ('TIME-CHK', time_chk, '[s] approximate offset of PC clock from GPS'),
-                    (None, None, None),
-                    ('COMMENT', ' ---           CAMERA INFORMATION            --- ', ''),
-                    ('CAMSWVER', SOFTWARE_VERSION, 'camera server software version'),
-                    ('CAMERA', self._camera_model + ' ({})'.format(self._camera_serial),
-                     'camera model and serial number'),
-                    ('INSTRARM', self._arm_name, 'camera identifier'),
-                    ('CCD-TEMP', round(self._temperature, 2),
-                     '[deg c] CCD temperature at end of exposure'),
-                    ('SET-TEMP', self._target_temperature, '[deg c] CCD temperature set point'),
-                    ('TEMP-LCK', self._temperature_locked,
-                     'CCD temperature is locked to set point'),
-                    ('CCD-XBIN', 1, '[px] x binning'),
-                    ('CCD-YBIN', 1, '[px] y binning'),
-                    ('CCD-WIND', '[{}:{},{}:{}]'.format(
-                        self._window_x1, self._window_x2,
-                        self._window_y1, self._window_y2),
-                     '[x1:x2,y1:y2] ccd window (detector coords)'),
-                    ('SHUTTER', shutter, 'shutter mode'),
-                    ('IMAG-RGN', '[1:{},1:{}]'.format(readout_width, readout_height),
-                     '[x1:x2,y1:y2] image region (image coords)'),
-                    ('EXPCNT', self._exposure_count, 'running exposure count since EXPCREF'),
-                    ('EXPCREF', self._exposure_count_reference,
-                     'date the exposure counter was reset'),
-                    ('SHTRCNT', self._shutter_count, 'running shutter count since SHTRCREF'),
-                    ('SHTRCREF', self._shutter_count_reference,
-                     'date the shutter counter was reset')
-                ]
-
-                # pylint: disable=no-member
-                shape = (readout_height, readout_width)
-                data = numpy.frombuffer(framedata, dtype=numpy.uint16).reshape(shape)
-                # pylint: enable=no-member
-                hdu = fits.PrimaryHDU(data)
-
-                # Using Card and append() to force comment cards to be placed inline
-                for h in header:
-                    if h[0] is not None and h[1] is None:
-                        h = ('COMMENT', ' ' + h[0] + ' not available', '')
-                    hdu.header.append(fits.Card(h[0], h[1], h[2]), end=True)
-
-                # Save errors shouldn't interfere with preview updates, so we use a separate
-                # try/catch
-                try:
-                    filename = self._output_frame_prefix + \
-                               '-{:08d}.fits'.format(self._exposure_count)
-                    path = str(self._output_directory / filename)
-
-                    # Simulate an atomic write by writing to a temporary file then renaming
-                    hdu.writeto(path + '.tmp', overwrite=True)
-                    shutil.move(path + '.tmp', path)
-                    print('Saving temporary frame: ' + filename)
-
-                except Exception as e:
-                    self._stop_acquisition = True
-                    print('Failed to save temporary frame: ' + str(e))
-                    log.error(self._log_table, 'Failed to save temporary frame (' \
-                                          + str(e) + ')')
-
-                # Hand frame over to the pipeline
-                # This may block if the pipeline is busy
-                try:
-                    with daemons.rasa_pipeline.connect(PIPELINE_HANDOVER_TIMEOUT) as pipeline:
-                        pipeline.notify_frame(self._arm_name, path)
-                except Exception as e:
-                    self._stop_acquisition = True
-                    print('Failed to hand frame to pipeline: ' + str(e))
-                    log.error(self._log_table, 'Failed to hand frame to pipeline (' + str(e) + ')')
-
                 # Continue exposure sequence?
                 self._sequence_frame_count += 1
-                if self._sequence_frame_limit > 0 and \
-                        self._sequence_frame_count >= self._sequence_frame_limit:
+                if 0 < self._sequence_frame_limit <= self._sequence_frame_count:
                     self._stop_acquisition = True
         finally:
-            print('exposure sequence: complete')
             if self._log_acquisition_status:
-                log.info(self._log_table, 'Exposure sequence complete')
+                log.info(self._config.log_name, 'Exposure sequence complete')
             self._status = CameraStatus.Idle
             self._stop_acquisition = False
 
     @Pyro4.expose
     def set_target_temperature(self, temperature, quiet=False):
         """Set the target camera temperature"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -563,14 +585,14 @@ class CameraDaemon:
             if self._status == CameraStatus.Disabled:
                 return CommandStatus.CameraNotInitialized
 
-            if temperature < self._min_temperature or temperature > self._max_temperature:
+            if temperature is None or temperature < self._min_temperature or temperature > self._max_temperature:
                 return CommandStatus.TemperatureOutsideLimits
 
             if not self.__set_target_temperature(temperature):
                 return CommandStatus.Failed
 
             if not quiet:
-                log.info(self._log_table, 'Target temperature set to ' + str(temperature))
+                log.info(self._config.log_name, 'Target temperature set to ' + str(temperature))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
@@ -620,7 +642,7 @@ class CameraDaemon:
     @Pyro4.expose
     def initialize(self):
         """Connects to the camera driver"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -633,12 +655,12 @@ class CameraDaemon:
             self._status = CameraStatus.Initializing
             print('initializing driver')
 
-            driver = CDLL('libfli.so')
+            driver = CDLL('/usr/local/lib/libfli.so')
             try:
                 # Enumerate cameras to find target
-                handle, model = open_device(driver, self._camera_serial)
+                handle, model = open_device(driver, self._config.camera_serial)
                 if handle.value < 0:
-                    print('camera with serial {} was not found'.format(self._camera_serial))
+                    print('camera with serial {} was not found'.format(self._config.camera_serial))
                     return CommandStatus.CameraNotFound
 
                 # Query detector size
@@ -718,8 +740,7 @@ class CameraDaemon:
                     self._window_y2 = self._visible_y2 - self._visible_y1
 
                     self._status = CameraStatus.Idle
-                    print('camera {} ({}) initialized'.format(self._camera_model,
-                                                              self._camera_serial))
+                    print('camera {} ({}) initialized'.format(self._camera_model, self._config.camera_serial))
 
                 return CommandStatus.Succeeded
             finally:
@@ -728,9 +749,9 @@ class CameraDaemon:
                     if driver is not None and handle.value >= 0:
                         driver.FLIClose(handle)
                     self._status = CameraStatus.Disabled
-                    log.error(self._log_table, 'Failed to initialize camera')
+                    log.error(self._config.log_name, 'Failed to initialize camera')
                 else:
-                    log.info(self._log_table, 'Initialized camera')
+                    log.info(self._config.log_name, 'Initialized camera')
 
     @Pyro4.expose
     def configure(self, params, quiet=False):
@@ -748,7 +769,7 @@ class CameraDaemon:
 
             Set quiet=True to disable log messages
         """
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -762,12 +783,12 @@ class CameraDaemon:
                 return CommandStatus.CameraNotIdle
 
             # Reset cooling
-            temperature = params.get('temperature', self._config['temperature'])
+            temperature = params.get('temperature', self._config.temperature_setpoint)
             if not self.__set_target_temperature(temperature):
                 return CommandStatus.Failed
 
             if not quiet:
-                log.info(self._log_table, 'Target temperature set to ' + str(temperature))
+                log.info(self._config.log_name, 'Target temperature set to ' + str(temperature))
 
             # Reset shutter
             shutter = params.get('shutter', False)
@@ -775,7 +796,7 @@ class CameraDaemon:
                 return CommandStatus.Failed
 
             if not quiet:
-                log.info(self._log_table, 'Shutter set to ' + ('auto' if shutter else 'closed'))
+                log.info(self._config.log_name, 'Shutter set to ' + ('auto' if shutter else 'closed'))
 
             # Reset window
             window = params.get('window', [
@@ -789,29 +810,29 @@ class CameraDaemon:
 
             if not quiet:
                 region = '[{}:{},{}:{}]'.format(window[0], window[1], window[2], window[3])
-                log.info(self._log_table, 'Window set to ' + region)
+                log.info(self._config.log_name, 'Window set to ' + region)
 
             # Reset exposure delay
-            self._exposure_delay = params.get('delay', self._config['delay'])
+            self._exposure_delay = params.get('delay', 0)
 
             if not quiet:
-                log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(
+                log.info(self._config.log_name, 'Exposure delay set to {:.3f}s'.format(
                     self._exposure_delay))
 
             # Reset exposure time
-            exposure = params.get('exposure', self._config['exposure'])
+            exposure = params.get('exposure', 1)
             if not self.__set_exposure_time(exposure):
                 return CommandStatus.Failed
 
             if not quiet:
-                log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(exposure))
+                log.info(self._config.log_name, 'Exposure time set to {:.3f}s'.format(exposure))
 
             return CommandStatus.Succeeded
 
     @Pyro4.expose
     def set_shutter(self, enabled, quiet=False):
         """Enable or disable the shutter"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -828,13 +849,13 @@ class CameraDaemon:
                 return CommandStatus.Failed
 
             if not quiet:
-                log.info(self._log_table, 'Shutter set to ' + ('auto' if enabled else 'closed'))
+                log.info(self._config.log_name, 'Shutter set to ' + ('auto' if enabled else 'closed'))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
     def set_exposure(self, seconds, quiet=False):
         """Set the exposure time in seconds"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -851,13 +872,13 @@ class CameraDaemon:
                 return CommandStatus.Failed
 
             if not quiet:
-                log.info(self._log_table, 'Exposure time set to {:.3f}s'.format(seconds))
+                log.info(self._config.log_name, 'Exposure time set to {:.3f}s'.format(seconds))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
     def set_exposure_delay(self, seconds, quiet=False):
         """Set the pre-exposure delay in seconds"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -873,13 +894,13 @@ class CameraDaemon:
             self._exposure_delay = seconds
 
             if not quiet:
-                log.info(self._log_table, 'Exposure delay set to {:.3f}s'.format(seconds))
+                log.info(self._config.log_name, 'Exposure delay set to {:.3f}s'.format(seconds))
             return CommandStatus.Succeeded
 
     @Pyro4.expose
     def set_window(self, window, quiet=False):
         """Sets the CCD readout window in unbinned (hardware) pixels"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -906,13 +927,13 @@ class CameraDaemon:
 
             if not quiet:
                 region = '[{}:{},{}:{}]'.format(window[0], window[1], window[2], window[3])
-                log.info(self._log_table, 'Window set to ' + region)
+                log.info(self._config.log_name, 'Window set to ' + region)
             return CommandStatus.Succeeded
 
     @Pyro4.expose
     def shutdown(self):
         """Disconnects from the camera driver"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -936,13 +957,13 @@ class CameraDaemon:
                 self._driver.FLIClose(self._handle)
                 self._driver = None
 
-            log.info(self._log_table, 'Shutdown camera')
+            log.info(self._config.log_name, 'Shutdown camera')
             return CommandStatus.Succeeded
 
     @Pyro4.expose
     def start_sequence(self, count, quiet=False):
         """Starts an exposure sequence with a set number of frames, or 0 to run until stopped"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         with TryLock(self._command_lock) as success:
@@ -963,7 +984,7 @@ class CameraDaemon:
                 count_msg = str(count) + ' frames'
 
             if not quiet:
-                log.info(self._log_table, 'Starting exposure sequence (' + count_msg + ')')
+                log.info(self._config.log_name, 'Starting exposure sequence (' + count_msg + ')')
 
             self._sequence_frame_limit = count
             self._sequence_frame_count = 0
@@ -979,7 +1000,7 @@ class CameraDaemon:
     @Pyro4.expose
     def stop_sequence(self):
         """Stops any active exposure sequence"""
-        if not pyro_client_matches(self._control_ips):
+        if not pyro_client_matches(self._config.control_ips):
             return CommandStatus.InvalidControlIP
 
         if self._status == CameraStatus.Disabled:
@@ -990,8 +1011,7 @@ class CameraDaemon:
         if self._status != CameraStatus.Acquiring or self._stop_acquisition:
             return CommandStatus.CameraNotAcquiring
 
-        print('aborting exposure sequence')
-        log.info(self._log_table, 'Aborting exposure sequence')
+        log.info(self._config.log_name, 'Aborting exposure sequence')
 
         self._sequence_frame_count = 0
         self._stop_acquisition = True
@@ -1001,10 +1021,10 @@ class CameraDaemon:
 
         return CommandStatus.Succeeded
 
+
 if __name__ == '__main__':
-    description = 'Camera control daemon'
-    parser = argparse.ArgumentParser(description=description)
-    parser.add_argument('camera', choices=CONFIG.keys(), help='Select a camera')
+    parser = argparse.ArgumentParser(description='Camera control daemon')
+    parser.add_argument('config', help='Path to configuration json file')
     args = parser.parse_args()
-    cam_config = CONFIG[args.camera]
-    cam_config['daemon'].launch(CameraDaemon(cam_config))
+    c = Config(args.config)
+    c.daemon.launch(CameraDaemon(c))

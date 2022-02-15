@@ -1,0 +1,15 @@
+[Unit]
+Description=Daemon for controlling a FLI ML50100 camera via Pyro.
+After=syslog.target
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Restart=on-failure
+Type=simple
+ExecStart=/usr/bin/env python3.6 -u /usr/bin/fli_camd /etc/camd/%i.json
+StandardOutput=syslog
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target

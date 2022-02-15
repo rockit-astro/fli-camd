@@ -1,0 +1,16 @@
+{
+  "daemon": "clasp_camera_1",
+  "pipeline_daemon": "clasp_pipeline",
+  "pipeline_handover_timeout": 10,
+  "log_name": "fli_camd@fli1",
+  "control_machines": ["CLASPTCS", "CLASPDAS1"],
+  "temperature_setpoint": -20,
+  "temperature_update_delay": 5,
+  "gps_port": "/dev/gpstimer",
+  "gps_baud": 9600,
+  "camera_id": "FLI1",
+  "camera_serial": "ML0701018",
+  "output_path": "/var/tmp/",
+  "output_prefix": "fli1",
+  "expcount_path": "/var/tmp/fli1-counter.json"
+}
